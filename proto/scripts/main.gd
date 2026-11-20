@@ -14,6 +14,15 @@ const HEAL_DROP_CHANCE := 0.015  # 击杀掉回血豆的概率
 const HEAL_DROP_AMOUNT := 8.0
 const HEAL_OFFER_CHANCE := 0.15  # 升级时热拿铁占一个选项的概率
 const BOSS_HP_BASE := 1200.0
+# 顾客订单
+const CUST_FIRST_T := 60.0
+const CUST_GAP := 75.0          # 上一位离开后 75 秒来下一位
+const CUST_TTL := 45.0
+const CUST_KILL_NEED := 3
+const CUST_BEAN_NEED := 8
+const CUST_ELITE_T := 300.0
+const CUST_ELITE_CHANCE := 0.25
+const ELITE_ORDER_TEXT := "去冰三分糖燕麦奶加浓缩"
 const BOSS_HP_PER_LV := 60.0     # Boss 血量 = 1200 + 60×进场等级
 const CAF_MAX := 45.0       # 咖啡因槽上限（颗豆子）
 const JITTER_TIME := 3.0    # 手抖时长
@@ -72,6 +81,7 @@ class Enemy:
 	var state := "chase"
 	var atk_i := 0
 	var dash_dir := Vector2.RIGHT
+	var elite := false
 
 
 # ---------------- 运行状态 ----------------
@@ -87,6 +97,10 @@ var facing := Vector2.UP
 var hp := PLAYER_MAX_HP
 var max_hp := PLAYER_MAX_HP
 var heals: Array = []
+var customers: Array = []   # 每项 {pos, kind(kill/bean/elite), need, have, ttl, elite, enemy}
+var next_cust_t := CUST_FIRST_T
+var cust_idx := 0
+var cust_stats := {"spawned": 0, "done": 0, "timeout": 0, "elite": 0, "boss_left": 0}
 var rerolls := 0
 var iframes := 0.0
 var hurt_flash := 0.0
@@ -165,6 +179,8 @@ var opt_steps := 1
 var opt_quit := false
 var opt_hp := -1.0
 var opt_boss_hp := -1.0
+var opt_order := ""
+var opt_pacifist := false
 var state_timer := 0.0
 var perf_update := 0.0
 var perf_draw := 0.0
@@ -227,6 +243,8 @@ func _parse_args() -> void:
 			"seed": rng.seed = int(v)
 			"hp": opt_hp = float(v)
 			"bosshp": opt_boss_hp = float(v)
+			"order": opt_order = v
+			"pacifist": opt_pacifist = v == "1"
 
 
 func _load_save() -> void:
@@ -300,6 +318,11 @@ func _start_run() -> void:
 	hint_t = 4.0
 	minute_waves_done = int(t / 60.0)
 	spawn_acc = 0.0
+	customers.clear()
+	next_cust_t = CUST_FIRST_T if t < CUST_FIRST_T else t + 5.0
+	cust_idx = 0
+	for k in cust_stats:
+		cust_stats[k] = 0
 	for arr in [enemies, beans, bullets, spits, puddles, ice_drops, slashes, rings, floats]:
 		arr.clear()
 	esp_cd = 0.5
@@ -366,6 +389,7 @@ func _update(dt: float) -> void:
 	_update_player(dt)
 	_update_caffeine(dt)
 	_spawn_director(dt)
+	_update_customers(dt)
 	_update_enemies(dt)
 	_update_weapons(dt)
 	_update_projectiles(dt)
@@ -500,6 +524,7 @@ func _spawn_director(dt: float) -> void:
 		if not boss_spawned:
 			boss_spawned = true
 			boss_log_t = t
+			_customers_leave_for_boss()
 			# 闹钟一响，场上小怪全被吓醒跑掉，留下豆子
 			for e in enemies:
 				if e.alive:
@@ -598,7 +623,9 @@ func _update_enemies(dt: float) -> void:
 			e.vel = e.vel.move_toward(Vector2.ZERO, 700 * dt)
 			continue
 		var mv := dir
-		if e.kind == K.MILK:
+		if e.elite:
+			mv = dir   # 复杂订单怪：一直追着玩家，不吐酸奶
+		elif e.kind == K.MILK:
 			if dist > 230:
 				mv = dir
 			elif dist < 150:
@@ -756,6 +783,7 @@ func _kill(e: Enemy) -> void:
 		_end_run(true)
 		return
 	_drop_bean(e.pos, e.xp)
+	_order_on_kill(e)
 	var hc: float = lerpf(0.06, HEAL_DROP_CHANCE, clamp((t - 90.0) / 150.0, 0.0, 1.0))  # 前1.5分钟6%，到4分钟降到1.5%
 	if rng.randf() < hc and heals.size() < 6:
 		heals.append({"pos": e.pos + Vector2(8, 0)})
@@ -765,12 +793,171 @@ func _kill(e: Enemy) -> void:
 			c.vel = Vector2(s * 160, rng.randf_range(-60, 60))
 
 
+# ================= 顾客订单 =================
+func _reward_heal(x: float) -> void:
+	hp = min(max_hp, hp + x)
+
+
+func _reward_coin(x: int) -> void:
+	bonus_coins += x
+
+
+func _update_customers(dt: float) -> void:
+	if t < RUN_LEN and customers.is_empty() and t >= next_cust_t:
+		_spawn_customer()
+	for c in customers:
+		c["ttl"] -= dt
+		if c["elite"]:
+			var e: Enemy = c["enemy"]
+			if e != null:
+				c["pos"] = e.pos
+		if c["have"] >= c["need"]:
+			_customer_done(c)
+		elif c["ttl"] <= 0:
+			_customer_timeout(c)
+	customers = customers.filter(func(c): return not c.get("gone", false))
+
+
+func _spawn_customer() -> void:
+	var kind := "kill" if cust_idx % 2 == 0 else "bean"
+	if t >= CUST_ELITE_T and rng.randf() < CUST_ELITE_CHANCE:
+		kind = "elite"
+	if opt_order != "":
+		kind = opt_order
+	cust_idx += 1
+	var c := {"pos": _customer_pos(), "kind": kind, "need": 1, "have": 0, "ttl": CUST_TTL, "elite": kind == "elite", "enemy": null, "born": t}
+	if kind == "kill":
+		c["need"] = CUST_KILL_NEED
+	elif kind == "bean":
+		c["need"] = CUST_BEAN_NEED
+	else:
+		var e := _spawn(K.MILK, _spawn_pos())
+		e.elite = true
+		e.speed = 70.0 * (1.0 + t / 1500.0)
+		c["enemy"] = e
+		c["pos"] = e.pos
+		cust_stats["elite"] += 1
+	customers.append(c)
+	cust_stats["spawned"] += 1
+	banner = "来客人了！"
+	banner_t = 1.5
+	print("COFFEE_CUSTOMER t=%.1f kind=%s need=%d" % [t, kind, c["need"]])
+
+
+func _customer_pos() -> Vector2:
+	# 屏幕边缘内侧随机一点（避开顶部 HUD 与底部技能栏），之后固定不动
+	var half := vs * 0.5
+	var x0 := -half.x + 34.0
+	var x1 := half.x - 34.0
+	var y0 := -half.y + 190.0
+	var y1 := half.y - 100.0
+	var side := rng.randi_range(0, 3)
+	var off := Vector2.ZERO
+	match side:
+		0: off = Vector2(rng.randf_range(x0, x1), y0)
+		1: off = Vector2(rng.randf_range(x0, x1), y1)
+		2: off = Vector2(x0, rng.randf_range(y0, y1))
+		_: off = Vector2(x1, rng.randf_range(y0, y1))
+	return ppos + off
+
+
+func _order_on_kill(e: Enemy) -> void:
+	for c in customers:
+		if c["kind"] == "kill":
+			c["have"] += 1
+		elif c["kind"] == "elite" and c["enemy"] == e:
+			c["have"] = 1
+
+
+func _order_on_bean() -> void:
+	for c in customers:
+		if c["kind"] == "bean":
+			c["have"] += 1
+
+
+func _customer_done(c: Dictionary) -> void:
+	var heal := 30.0 if c["elite"] else 20.0
+	var coin := 30 if c["elite"] else 15
+	_reward_heal(heal)
+	_reward_coin(coin)
+	_float(ppos + Vector2(0, -48), "小费 +%d · 热拿铁 +%d" % [coin, int(heal)], C_XP.darkened(0.2), 18)
+	c["gone"] = true
+	c["enemy"] = null
+	next_cust_t = t + CUST_GAP
+	cust_stats["done"] += 1
+	print("COFFEE_ORDER_DONE t=%.1f kind=%s hp=%.0f bonus=%d" % [t, c["kind"], hp, bonus_coins])
+
+
+func _customer_timeout(c: Dictionary) -> void:
+	if c["elite"] and c["enemy"] != null:
+		var e: Enemy = c["enemy"]
+		e.alive = false   # 订单怪自己走掉，不掉豆子
+	_float(c["pos"] + Vector2(0, -40), "客人走了…", C_BROWN, 18)
+	c["gone"] = true
+	c["enemy"] = null
+	next_cust_t = t + CUST_GAP
+	cust_stats["timeout"] += 1
+	print("COFFEE_ORDER_TIMEOUT t=%.1f kind=%s next=%.1f" % [t, c["kind"], next_cust_t])
+
+
+func _customers_leave_for_boss() -> void:
+	for c in customers:
+		if c["elite"] and c["enemy"] != null:
+			var e: Enemy = c["enemy"]
+			e.alive = false
+		cust_stats["boss_left"] += 1
+		print("COFFEE_ORDER_BOSSLEAVE t=%.1f kind=%s" % [t, c["kind"]])
+	if not customers.is_empty():
+		_float(ppos + Vector2(0, -60), "客人走了…", C_BROWN, 18)
+	customers.clear()
+
+
+func _draw_customers() -> void:
+	# 在世界坐标里画（HUD 之后再画，所以不会挡住顶部的 Boss 血条）
+	for c in customers:
+		var p: Vector2 = c["pos"]
+		if not c["elite"]:
+			draw_circle(p, 17, C_CREAM)
+			draw_arc(p, 17, 0, TAU, 28, C_BROWN, 3, true)
+			_text(p, "客", 18, C_DARK)
+		var label: String
+		if c["kind"] == "kill":
+			label = "3份浓缩  %d/%d" % [c["have"], c["need"]]
+		elif c["kind"] == "bean":
+			label = "收8颗豆  %d/%d" % [c["have"], c["need"]]
+		else:
+			label = ELITE_ORDER_TEXT
+		var fs := 17
+		var w := font.get_string_size(label, HORIZONTAL_ALIGNMENT_LEFT, -1, fs).x + 46
+		var bp := p + Vector2(0, -46.0 if c["elite"] else -50.0)
+		var br := Rect2(bp.x - w * 0.5, bp.y - 17, w, 34)
+		# 气泡别出屏：贴边时整体往里挪，小尖角仍指着顾客
+		var vl := ppos.x - vs.x * 0.5 + 6.0
+		var vr := ppos.x + vs.x * 0.5 - 6.0 - w
+		if vr > vl:
+			br.position.x = clampf(br.position.x, vl, vr)
+		draw_style_box(_sb(Color(1, 1, 1, 0.95), C_BROWN, 12, 2), br)
+		draw_colored_polygon(PackedVector2Array([bp + Vector2(-7, 16), bp + Vector2(7, 16), bp + Vector2(0, 26)]), C_BROWN)
+		var ic := Vector2(br.position.x + 18, bp.y)
+		if c["kind"] == "bean":
+			_bean(ic, 2)
+		else:
+			draw_circle(ic, 11, Color(SKILLS["espresso"]["color"]))
+			_text(ic, SKILLS["espresso"]["icon"], 12, C_CREAM)
+		_text_left(Vector2(br.position.x + 34, bp.y), label, fs, C_DARK)
+		# 剩余时间条
+		var k: float = clamp(c["ttl"] / CUST_TTL, 0.0, 1.0)
+		draw_rect(Rect2(br.position.x + 8, br.end.y - 5, (w - 16) * k, 3), C_RED if k < 0.3 else C_XP)
+
+
 # ================= 武器 =================
 func _foam_cd() -> float:
 	return [5.0, 4.0, 4.0, 3.0, 3.0][skills.get("foam", 1) - 1]
 
 
 func _update_weapons(dt: float) -> void:
+	if opt_pacifist:
+		return   # 测试参数：不开火（用来测订单超时）
 	var am := _atk_mult()
 	# 浓缩弹
 	var lv: int = skills.get("espresso", 0)
@@ -990,6 +1177,7 @@ func _update_beans(dt: float) -> void:
 		if l < PR + 6:
 			xp += int(b["v"])
 			_gain_caffeine()
+			_order_on_bean()
 			while xp >= _xp_need(level + pending_levels):
 				xp -= _xp_need(level + pending_levels)
 				pending_levels += 1
@@ -1030,9 +1218,9 @@ func _pick(i: int) -> void:
 		return
 	var id: String = options[i]
 	if id == "heal":
-		hp = min(max_hp, hp + 30)
+		_reward_heal(30.0)
 	elif id == "coin":
-		bonus_coins += 20
+		_reward_coin(20)
 	else:
 		skills[id] = skills.get(id, 0) + 1
 		if id == "foam" and skills[id] == 1:
@@ -1370,6 +1558,7 @@ func _draw_world() -> void:
 	for e in enemies:
 		if _on_screen(e.pos, e.r + 30):
 			_draw_enemy(e)
+	_draw_customers()
 	# Boss 冲撞预警
 	if boss != null and boss.state == "tele_dash":
 		var a: float = 0.2 + 0.2 * sin(clock * 30)
@@ -1426,6 +1615,15 @@ func _draw_world() -> void:
 	draw_set_transform(Vector2.ZERO)
 	if hurt_flash > 0:
 		draw_rect(Rect2(Vector2.ZERO, vs), Color(0.8, 0.1, 0.05, hurt_flash * 0.6))
+	# 顾客屏外指示
+	for c in customers:
+		if not _on_screen(c["pos"], -20):
+			var d: Vector2 = (c["pos"] - ppos).normalized()
+			var cc: Vector2 = (vs * 0.5 + d * vs.length()).clamp(Vector2(26, 150), vs - Vector2(26, 90))
+			draw_circle(cc, 15, C_CREAM)
+			draw_arc(cc, 15, 0, TAU, 24, C_BROWN, 2, true)
+			_text(cc, "客", 15, C_DARK)
+			draw_colored_polygon(PackedVector2Array([cc + d * 24, cc + d.orthogonal() * 7 + d * 14, cc - d.orthogonal() * 7 + d * 14]), C_BROWN)
 	# Boss 屏外指示
 	if boss != null and not _on_screen(boss.pos, -10):
 		var d := (boss.pos - ppos).normalized()
@@ -1569,6 +1767,11 @@ func _draw_hud() -> void:
 		draw_rect(br, Color(0, 0, 0, 0.3))
 		draw_rect(Rect2(br.position, Vector2(br.size.x * boss.hp / boss.max_hp, 14)), C_RED)
 		_text(Vector2(vs.x * 0.5, 122), "周一早晨", 16, C_RED, 3, C_CREAM)
+	# 订单小字（Boss 战时没有顾客，不会和 Boss 血条抢位置）
+	if boss == null and not customers.is_empty():
+		var c: Dictionary = customers[0]
+		var os := "订单 %d/%d · 还剩%d秒" % [c["have"], c["need"], int(ceil(c["ttl"]))]
+		_text(Vector2(vs.x * 0.5, 104), os, 15, C_BROWN, 3, C_CREAM)
 	# 技能栏
 	var x := 16.0
 	for id in SKILL_ORDER:
@@ -1661,7 +1864,10 @@ func _draw_result() -> void:
 		var vw := font.get_string_size(rows[i][1], HORIZONTAL_ALIGNMENT_LEFT, -1, 26).x
 		_text_left(Vector2(pr.end.x - 36 - vw, ry), rows[i][1], 26, C_DARK)
 		draw_line(Vector2(pr.position.x + 30, ry + 24), Vector2(pr.end.x - 30, ry + 24), Color(0.42, 0.26, 0.15, 0.15), 1)
-	_text(Vector2(cx, y + 352), "金币总数 %d" % total_coins, 16, C_BROWN)
+	var tot := "金币总数 %d" % total_coins
+	if bonus_coins > 0:
+		tot = "含小费 +%d · 金币总数 %d" % [bonus_coins, total_coins]
+	_text(Vector2(cx, y + 352), tot, 16, C_BROWN)
 	_button("again", Rect2(cx - 120, y + 378, 240, 70), "再来一局")
 	_button("title", Rect2(cx - 70, pr.end.y + 18, 140, 48), "回标题", false)
 
@@ -1763,7 +1969,7 @@ func _export_state() -> void:
 		"mode": mode, "t": snappedf(t, 0.1), "hp": snappedf(hp, 0.1), "level": level, "xp": xp, "kills": kills,
 		"enemies": enemies.size(), "kinds": counts, "beans": beans.size(), "caf": snappedf(caf, 0.1), "jitter": jitter > 0,
 		"ppos": [snappedf(ppos.x, 0.1), snappedf(ppos.y, 0.1)], "skills": skills, "options": options,
-		"boss_hp": boss.hp if boss != null else -1, "boss_state": boss.state if boss != null else "", "total_coins": total_coins, "meta": meta, "rerolls": rerolls, "max_hp": max_hp, "heals": heals.size(), "run_coins": run_coins, "win": run_win,
+		"boss_hp": boss.hp if boss != null else -1, "boss_state": boss.state if boss != null else "", "total_coins": total_coins, "meta": meta, "rerolls": rerolls, "max_hp": max_hp, "heals": heals.size(), "bonus_coins": bonus_coins, "next_cust_t": snappedf(next_cust_t, 0.1), "cust_stats": cust_stats, "customers": customers.map(func(c): return {"kind": c["kind"], "need": c["need"], "have": c["have"], "ttl": snappedf(c["ttl"], 0.1), "elite": c["elite"], "born": snappedf(c["born"], 0.1)}), "run_coins": run_coins, "win": run_win,
 		"fps": Engine.get_frames_per_second(), "us_update": int(perf_update), "us_draw": int(perf_draw), "vw": vs.x, "vh": vs.y, "targets": tg,
 	}
 	JavaScriptBridge.eval("window.__coffee=" + JSON.stringify(st) + ";", true)
