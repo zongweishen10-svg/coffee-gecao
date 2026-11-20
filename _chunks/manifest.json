@@ -1,0 +1,14 @@
+[
+ {
+  "name": "index.pck",
+  "file": "index.pck.b64",
+  "size": 217056,
+  "sha256": "e2f6ca77cbacb43a50b4da709067900bc2df2a1480d0565991f48afd21402d43"
+ },
+ {
+  "name": "proto/assets/NotoSansSC-subset.ttf",
+  "file": "proto__assets__NotoSansSC-subset.ttf.b64",
+  "size": 208972,
+  "sha256": "dc88e402f80c2cc7101d38138543832799fbb24e987c08721fb36c9d012ddad3"
+ }
+]
