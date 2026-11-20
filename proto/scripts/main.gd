@@ -26,6 +26,8 @@ const ELITE_ORDER_TEXT := "去冰三分糖燕麦奶加浓缩"
 const BOSS_HP_PER_LV := 60.0     # Boss 血量 = 1200 + 60×进场等级
 const CAF_MAX := 45.0       # 咖啡因槽上限（颗豆子）
 const JITTER_TIME := 3.0    # 手抖时长
+const BURST_WINDOW := 5.0   # 满槽待发窗口：5 秒内点「爆发」，不点就手抖
+const BURST_R := 34.0       # 爆发按钮半径
 const MAX_LV := 5
 
 const C_BG := Color("#efe2cc")
@@ -38,6 +40,13 @@ const C_RED := Color("#c0392b")
 const C_XP := Color("#e0a63a")
 
 const SKILL_ORDER := ["espresso", "kettle", "foam", "ice", "grinder", "latte"]
+# 技能拼配：两个技能都到 Lv3 自动成一杯，多一条联动规则（id 别和技能 latte 撞名）
+const BLENDS := {
+	"americano": {"name": "冰美式", "a": "espresso", "b": "ice", "need": 3, "desc": "浓缩弹命中会减速。"},
+	"latteart": {"name": "拿铁", "a": "foam", "b": "latte", "need": 3, "desc": "盾挡住时反手一刀。"},
+	"pourover": {"name": "手冲套装", "a": "kettle", "b": "grinder", "need": 3, "desc": "热水处也会绞伤。"},
+}
+const C_GOLD := Color("#e0a526")
 const SKILLS := {
 	"kettle": {"name": "手冲壶", "icon": "壶", "color": "#4f9bc7", "desc": "身边每秒转一圈热水。",
 		"ups": ["手冲壶多转一股热水。", "手冲壶的热水更烫了。", "手冲壶再多转一股热水。", "手冲壶转得更大更烫。"]},
@@ -111,7 +120,15 @@ var pending_levels := 0
 var caf := 0.0
 var caf_idle := 0.0
 var jitter := 0.0
-var burst_unlocked := false   # 局外解锁「爆发」的钩子：本原型始终 false
+var burst_unlocked := false   # 旧存档字段：保留读写但不再参与判断（爆发开局即有）
+var caf_full_t := 0.0         # 满槽待发倒计时，>0 即待发中
+var burst_count := 0          # 本局爆发次数（只用于状态导出）
+var blends := {}              # 已激活的拼配 id
+var kettle_pts: Array = []    # 本帧每股热水的位置（手冲套装用）
+var blend_stats := {"slow_hits": 0, "slashes": 0, "blocks": 0, "pour_hits": 0}
+var opt_skills := {}          # 测试参数：开局技能等级
+var opt_offer: Array = []     # 测试参数：选卡必出的技能
+var burst_tip_done := false   # 本次打开游戏是否已经讲过满槽二选一
 var in_puddle := false
 var skills := {}               # id -> level
 var options: Array = []
@@ -178,6 +195,7 @@ var seen_jitter_tip := false
 var opt_steps := 1
 var opt_quit := false
 var opt_hp := -1.0
+var opt_caf := 0.0   # 测试参数：开局咖啡因（还差几颗豆满槽）
 var opt_boss_hp := -1.0
 var opt_order := ""
 var opt_pacifist := false
@@ -245,6 +263,13 @@ func _parse_args() -> void:
 			"bosshp": opt_boss_hp = float(v)
 			"order": opt_order = v
 			"pacifist": opt_pacifist = v == "1"
+			"caf": opt_caf = float(v)
+			"skills":
+				for kv2 in v.split(",", false):
+					var pr := kv2.split(":")
+					if pr.size() == 2:
+						opt_skills[pr[0]] = int(pr[1])
+			"offer": opt_offer = Array(v.split(",", false))
 
 
 func _load_save() -> void:
@@ -304,10 +329,22 @@ func _start_run() -> void:
 	xp = 0
 	kills = 0
 	pending_levels = 0
-	caf = 0.0
+	caf = clampf(opt_caf, 0.0, CAF_MAX - 1.0)
 	caf_idle = 0.0
 	jitter = 0.0
+	caf_full_t = 0.0
+	burst_count = 0
 	skills = {"espresso": 1}
+	for k in opt_skills:
+		if int(opt_skills[k]) <= 0:
+			skills.erase(k)
+		else:
+			skills[k] = int(opt_skills[k])
+	blends = {}
+	kettle_pts = []
+	blend_stats = {"slow_hits": 0, "slashes": 0, "blocks": 0, "pour_hits": 0}
+	if not opt_skills.is_empty():
+		_check_blends()   # 测试参数直接给了双 Lv3 时立刻成杯
 	run_win = false
 	run_coins = 0
 	bonus_coins = 0
@@ -388,6 +425,8 @@ func _update(dt: float) -> void:
 	hurt_flash -= dt
 	_update_player(dt)
 	_update_caffeine(dt)
+	if opt_auto and caf_full_t > 0 and caf_full_t < BURST_WINDOW - 1.0:
+		_activate("burst")   # 模拟跑局：待发剩不到 4 秒就自动爆发
 	_spawn_director(dt)
 	_update_customers(dt)
 	_update_enemies(dt)
@@ -401,7 +440,7 @@ func _update(dt: float) -> void:
 
 
 func _atk_mult() -> float:
-	if jitter > 0:
+	if jitter > 0 or caf_full_t > 0:
 		return 2.0
 	return 1.0 + caf / CAF_MAX
 
@@ -455,6 +494,16 @@ func _bot_dir() -> Vector2:
 
 
 func _update_caffeine(dt: float) -> void:
+	if caf_full_t > 0:
+		# 满槽待发：拾豆不续时，倒计时到了就老规则手抖
+		caf_full_t -= dt
+		caf = CAF_MAX
+		if caf_full_t <= 0:
+			caf_full_t = 0.0
+			jitter = JITTER_TIME
+			_float(ppos + Vector2(0, -40), "手抖！", C_RED, 22)
+			print("COFFEE_JITTER t=%.1f" % t)
+		return
 	if jitter > 0:
 		jitter -= dt
 		caf = CAF_MAX * max(jitter, 0.0) / JITTER_TIME
@@ -467,7 +516,7 @@ func _update_caffeine(dt: float) -> void:
 
 
 func _gain_caffeine() -> void:
-	if jitter > 0:
+	if jitter > 0 or caf_full_t > 0:
 		return
 	caf_idle = 0.0
 	caf += 1.0
@@ -477,23 +526,22 @@ func _gain_caffeine() -> void:
 
 
 func _on_caffeine_full() -> void:
-	# 钩子：以后局外解锁后，满槽改成「爆发」清屏。
-	if burst_unlocked:
-		_espresso_burst()
-		caf = 0.0
-	else:
-		jitter = JITTER_TIME
+	# 满槽不再自动手抖：进入 5 秒待发，由玩家决定爆发还是贪攻速
+	caf_full_t = BURST_WINDOW
+	_float(ppos + Vector2(0, -40), "满槽！", C_RED, 22)
+	print("COFFEE_FULL t=%.1f" % t)
+	if not burst_tip_done:
+		burst_tip_done = true
+		tip_text = "满槽了：5秒内点爆发清屏，不点就手抖"
+		tip_t = 3.5
 		if not seen_jitter_tip:
 			seen_jitter_tip = true
-			tip_text = "咖啡喝多了：攻速翻倍，子弹乱喷3秒！"
-			tip_t = 3.5
 			_save()
-		_float(ppos + Vector2(0, -40), "手抖！", C_RED, 22)
-		print("COFFEE_JITTER t=%.1f" % t)
 
 
 func _espresso_burst() -> void:
-	# 预留：浓缩冲击，清掉屏幕内的普通敌人。原型里不会触发。
+	# 浓缩冲击：屏内普通怪全灭（走正常伤害结算），Boss 吃 300
+	print("COFFEE_BURST t=%.1f kills=%d" % [t, kills])
 	for e in enemies:
 		if e.kind != K.BOSS and _on_screen(e.pos, 0):
 			_damage(e, 9999.0)
@@ -747,12 +795,18 @@ func _hurt(dmg: float) -> void:
 		shield_cd = _foam_cd()
 		iframes = 0.5
 		_float(ppos + Vector2(0, -36), "挡住！", Color("#4f9bc7"), 18)
+		blend_stats["blocks"] += 1
 		if skills.get("foam", 0) >= 3:
 			for e in enemies:
 				var d := e.pos - ppos
 				if d.length() < 110 and e.kind != K.BOSS:
 					e.vel += d.normalized() * 420
 					_damage(e, 12.0)
+		if blends.has("latteart"):
+			# 拿铁：挡住后朝当前朝向反手一刀（只放正向一刀）
+			_slash(facing, skills.get("latte", 1))
+			blend_stats["slashes"] += 1
+			print("COFFEE_BLEND_SLASH t=%.1f" % t)
 		return
 	hp -= dmg
 	iframes = 0.8 if t < 120 else 0.6
@@ -850,7 +904,7 @@ func _customer_pos() -> Vector2:
 	var x0 := -half.x + 34.0
 	var x1 := half.x - 34.0
 	var y0 := -half.y + 190.0
-	var y1 := half.y - 100.0
+	var y1 := half.y - 140.0   # 底部留给技能栏和爆发按钮
 	var side := rng.randi_range(0, 3)
 	var off := Vector2.ZERO
 	match side:
@@ -991,9 +1045,11 @@ func _update_weapons(dt: float) -> void:
 		var n: int = [1, 2, 2, 3, 3][lv - 1]
 		var dmg: float = [8, 8, 12, 12, 16][lv - 1]
 		var rad: float = [64, 64, 64, 64, 84][lv - 1]
+		kettle_pts.clear()
 		for i in n:
 			var a := kettle_ang + TAU * i / n
 			var p := ppos + Vector2(cos(a), sin(a)) * rad
+			kettle_pts.append(p)
 			for e in enemies:
 				if e.alive and clock >= e.kettle_next and p.distance_squared_to(e.pos) < pow(e.r + 11, 2):
 					e.kettle_next = clock + 0.45
@@ -1006,8 +1062,19 @@ func _update_weapons(dt: float) -> void:
 			grind_tick = 0.25
 			var rad: float = _grind_r()
 			var dps: float = [10, 10, 18, 18, 18][lv - 1]
+			var pour: bool = blends.has("pourover") and int(skills.get("kettle", 0)) > 0
 			for e in enemies:
-				if e.alive and ppos.distance_squared_to(e.pos) < pow(rad + e.r, 2):
+				if not e.alive:
+					continue
+				var hit := ppos.distance_squared_to(e.pos) < pow(rad + e.r, 2)
+				if not hit and pour:
+					# 手冲套装：每股热水处也是一个半径 30 的绞伤圈（同一敌人每跳只算一次）
+					for kp in kettle_pts:
+						if (kp as Vector2).distance_squared_to(e.pos) < pow(30.0 + e.r, 2):
+							hit = true
+							blend_stats["pour_hits"] += 1
+							break
+				if hit:
 					_damage(e, dps * 0.25 * (0.5 if e.kind == K.BOSS else 1.0))
 					if lv >= 5:
 						e.slow = 0.5
@@ -1096,6 +1163,9 @@ func _update_projectiles(dt: float) -> void:
 				continue
 			if b["pos"].distance_squared_to(e.pos) < pow(e.r + 5, 2):
 				_damage(e, b["dmg"], b["vel"].normalized(), 90)
+				if blends.has("americano"):
+					e.slow = max(e.slow, 1.0)   # 冰美式：命中减速 1 秒，取 max 不叠加
+					blend_stats["slow_hits"] += 1
 				b["hits"].append(e)
 				b["pierce"] -= 1
 				if b["pierce"] < 0:
@@ -1201,6 +1271,12 @@ func _open_picker() -> void:
 		pool[i] = pool[j]
 		pool[j] = tmp
 	options = pool.slice(0, 3)
+	for oi in opt_offer.size():
+		var fid: String = opt_offer[oi]
+		if oi < 3 and skills.get(fid, 0) < MAX_LV:
+			options.erase(fid)
+			options.insert(oi, fid)
+	options = options.slice(0, 3)
 	if options.size() == 3 and hp < max_hp and rng.randf() < HEAL_OFFER_CHANCE:
 		options[2] = "heal"
 	if options.size() < 3:
@@ -1230,7 +1306,46 @@ func _pick(i: int) -> void:
 	pending_levels -= 1
 	print("COFFEE_PICK ", id, " -> ", skills.get(id, 0), " level=", level)
 	picker_gap = 4.0  # 升级之间至少隔 4 秒，积压的升级排队
+	_check_blends()
 	mode = "play"
+
+
+func _check_blends() -> void:
+	for bid in BLENDS:
+		var b: Dictionary = BLENDS[bid]
+		if blends.has(bid):
+			continue
+		if skills.get(b["a"], 0) >= int(b["need"]) and skills.get(b["b"], 0) >= int(b["need"]):
+			blends[bid] = true
+			# 选卡后立刻回到 play，下一次选卡至少隔 4 秒，2 秒横幅不会被盖住
+			banner = "拼配完成：%s！" % b["name"]
+			banner_t = 2.0
+			print("COFFEE_BLEND ", bid, " t=%.1f" % t)
+
+
+func _blend_hint(id: String) -> String:
+	# 这张卡升完正好补齐一个拼配（本技能 Lv2→3 且搭档已 ≥3）才提示
+	if skills.get(id, 0) != 2:
+		return ""
+	for bid in BLENDS:
+		var b: Dictionary = BLENDS[bid]
+		if blends.has(bid):
+			continue
+		var other := ""
+		if b["a"] == id:
+			other = b["b"]
+		elif b["b"] == id:
+			other = b["a"]
+		if other != "" and skills.get(other, 0) >= int(b["need"]):
+			return b["name"]
+	return ""
+
+
+func _in_blend(id: String) -> bool:
+	for bid in blends:
+		if BLENDS[bid]["a"] == id or BLENDS[bid]["b"] == id:
+			return true
+	return false
 
 
 func _float(pos: Vector2, text: String, col: Color, size: int) -> void:
@@ -1248,7 +1363,11 @@ func _on_screen(p: Vector2, margin: float) -> bool:
 func _input(event: InputEvent) -> void:
 	if event is InputEventScreenTouch:
 		last_touch_ms = Time.get_ticks_msec()
-		if event.pressed and touch_idx < 0:
+		if event.pressed and touch_idx >= 0 and event.index != touch_idx:
+			# 一只手指在走位时，另一只手指按爆发也算（不打断走位）
+			if _burst_hit(event.position):
+				_activate("burst")
+		elif event.pressed and touch_idx < 0:
 			touch_idx = event.index
 			_pointer(true, event.position)
 		elif not event.pressed and event.index == touch_idx:
@@ -1272,8 +1391,15 @@ func _input(event: InputEvent) -> void:
 
 
 func _pointer(pressed: bool, pos: Vector2) -> void:
+	if pressed and _burst_hit(pos):
+		# 爆发按钮按下即触发，这一下不当作走位（不设 pointer_down / anchor）
+		press_target = ""
+		_activate("burst")
+		return
 	if pressed:
 		press_target = _target_at(pos)
+		if mode == "levelup" and picker_age < 0.5:
+			press_target = ""   # 选卡刚弹出时还在走位的手指按下去不算选卡，防误触
 		if mode == "play":
 			pointer_down = true
 			pointer_pos = pos
@@ -1286,6 +1412,19 @@ func _pointer(pressed: bool, pos: Vector2) -> void:
 		if tg != "" and tg == press_target:
 			_activate(tg)
 		press_target = ""
+
+
+func _burst_rect() -> Rect2:
+	# 爆发按钮的唯一几何来源：右下角，避开左下技能栏、底部顾客站位和屏外指示
+	var c := Vector2(vs.x - 16.0 - BURST_R, vs.y - 36.0 - BURST_R)
+	return Rect2(c - Vector2(BURST_R, BURST_R), Vector2(BURST_R, BURST_R) * 2.0)
+
+
+func _burst_hit(pos: Vector2) -> bool:
+	if mode != "play" or caf_full_t <= 0:
+		return false
+	var r := _burst_rect()
+	return pos.distance_to(r.get_center()) <= BURST_R + 6.0   # 圆形判定，留一点手指余量
 
 
 func _pointer_move(pos: Vector2) -> void:
@@ -1308,6 +1447,13 @@ func _activate(name: String) -> void:
 		"title":
 			if mode == "result":
 				mode = "title"
+		"burst":
+			if mode == "play" and caf_full_t > 0:
+				_espresso_burst()
+				caf = 0.0
+				caf_full_t = 0.0
+				caf_idle = 0.0
+				burst_count += 1
 		"reroll":
 			if mode == "levelup" and rerolls > 0 and picker_age > 0.3:
 				rerolls -= 1
@@ -1442,14 +1588,8 @@ func _draw_title() -> void:
 	_text(Vector2(cx, y0), "强化（永久）", 20, C_DARK)
 	var rw := vs.x - 32
 	var rh := 74.0
-	for i in SHOP.size() + 1:
+	for i in SHOP.size():
 		var rr := Rect2(16, y0 + 22 + i * (rh + 10), rw, rh)
-		if i == SHOP.size():
-			# 预留：浓缩冲击（满槽爆发）以后在这里解锁
-			draw_style_box(_sb(Color(1, 1, 1, 0.35), Color(0.42, 0.26, 0.15, 0.35), 16, 2), rr)
-			_text_left(rr.position + Vector2(18, 24), "浓缩冲击", 20, Color(0.42, 0.26, 0.15, 0.55))
-			_text_left(rr.position + Vector2(18, 52), "满槽改成清屏爆发，即将开放。", 15, Color(0.42, 0.26, 0.15, 0.55))
-			continue
 		var it: Dictionary = SHOP[i]
 		var lv: int = meta[it["id"]]
 		var maxed := lv >= int(it["max"])
@@ -1619,7 +1759,7 @@ func _draw_world() -> void:
 	for c in customers:
 		if not _on_screen(c["pos"], -20):
 			var d: Vector2 = (c["pos"] - ppos).normalized()
-			var cc: Vector2 = (vs * 0.5 + d * vs.length()).clamp(Vector2(26, 150), vs - Vector2(26, 90))
+			var cc: Vector2 = (vs * 0.5 + d * vs.length()).clamp(Vector2(26, 150), vs - Vector2(26, 130))
 			draw_circle(cc, 15, C_CREAM)
 			draw_arc(cc, 15, 0, TAU, 24, C_BROWN, 2, true)
 			_text(cc, "客", 15, C_DARK)
@@ -1628,7 +1768,7 @@ func _draw_world() -> void:
 	if boss != null and not _on_screen(boss.pos, -10):
 		var d := (boss.pos - ppos).normalized()
 		var c := vs * 0.5 + d * Vector2(vs.x * 0.5 - 30, vs.y * 0.5 - 90).length() * 0.6
-		c = c.clamp(Vector2(30, 120), vs - Vector2(30, 90))
+		c = c.clamp(Vector2(30, 120), vs - Vector2(30, 130))
 		var pts := PackedVector2Array([c + d * 18, c + d.orthogonal() * 12 - d * 8, c - d.orthogonal() * 12 - d * 8])
 		draw_colored_polygon(pts, C_RED)
 
@@ -1649,8 +1789,9 @@ func _draw_enemy(e: Enemy) -> void:
 	var p := e.pos
 	var fl := e.flash > 0
 	var frozen := e.freeze > 0
+	var slowed := frozen or e.slow > 0   # 减速也用冻结同款淡蓝调色
 	if atlas != null and e.kind != K.BOSS:
-		var mod := Color(1.9, 1.9, 1.9) if fl else (Color(0.75, 0.92, 1.3) if frozen else Color.WHITE)
+		var mod := Color(1.9, 1.9, 1.9) if fl else (Color(0.75, 0.92, 1.3) if slowed else Color.WHITE)
 		match e.kind:
 			K.WORM:
 				_spr(S.WORM_Z if int(e.phase * 0.7) % 3 == 0 else S.WORM, p + Vector2(0, sin(e.phase * 6.0) * 1.2), 1.0, mod)
@@ -1696,6 +1837,8 @@ func _draw_enemy(e: Enemy) -> void:
 			draw_arc(p + Vector2(0, 10), 4, PI * 1.15, PI * 1.85, 6, C_DARK, 2)
 		K.BOSS:
 			_draw_boss(e)
+			if e.slow > 0:
+				draw_arc(p, e.r + 6, 0, TAU, 40, Color(0.6, 0.85, 1.0, 0.8), 5, true)
 	if frozen:
 		draw_circle(p, e.r + 3, Color(0.6, 0.85, 1.0, 0.45))
 	if e.kind == K.MILK or e.kind == K.GROUNDS:
@@ -1743,12 +1886,14 @@ func _draw_hud() -> void:
 	var k := caf / CAF_MAX
 	if k > 0.01:
 		var fc := C_CAF
-		if jitter > 0:
+		if jitter > 0 or caf_full_t > 0:
 			fc = C_RED if int(clock * 10) % 2 == 0 else C_CAF
 		draw_style_box(_sb(fc, Color(0, 0, 0, 0), 11, 0), Rect2(bx, 14, max(22.0, bw * k), 22))
 	var label := "咖啡因  攻速×%.1f" % _atk_mult()
 	if jitter > 0:
 		label = "手抖！子弹乱飞"
+	elif caf_full_t > 0:
+		label = "满槽！点爆发  %d秒 · 攻速×%.1f" % [int(ceil(caf_full_t)), _atk_mult()]
 	_text(bar.get_center(), label, 14, C_CREAM, 3, C_DARK)
 	# 经验条
 	var need := _xp_need(level + pending_levels)
@@ -1780,8 +1925,21 @@ func _draw_hud() -> void:
 			continue
 		var c := Vector2(x + 20, vs.y - 34)
 		_icon(c, id, 18)
+		if _in_blend(id):
+			draw_arc(c, 19.5, 0, TAU, 28, C_GOLD, 3.5, true)
 		_text(c + Vector2(14, 14), str(lv), 13, C_CREAM, 4, C_DARK)
 		x += 48
+	# 爆发按钮（只在待发时出现；画和点击判定共用 _burst_rect）
+	if caf_full_t > 0 and mode == "play":
+		var brc := _burst_rect()
+		var bc := brc.get_center()
+		var pulse := 1.0 + 0.06 * sin(clock * 12.0)
+		draw_circle(bc, BURST_R * pulse + 5, Color(0.75, 0.15, 0.1, 0.25))
+		draw_circle(bc, BURST_R * pulse, C_BROWN)
+		draw_arc(bc, BURST_R * pulse, 0, TAU, 32, C_DARK, 3, true)
+		draw_arc(bc, BURST_R + 6, -PI * 0.5, -PI * 0.5 + TAU * caf_full_t / BURST_WINDOW, 32, C_RED, 4, true)
+		_text(bc, "爆发", 20, C_CREAM)
+		targets.append({"name": "burst", "rect": brc})
 	# 开局提示
 	if hint_t > 0:
 		var a: float = min(1.0, hint_t)
@@ -1790,7 +1948,10 @@ func _draw_hud() -> void:
 		var ta: float = min(1.0, tip_t)
 		var tr := Rect2(16, vs.y * 0.36 - 24, vs.x - 32, 48)
 		draw_style_box(_sb(Color(0.23, 0.14, 0.09, 0.8 * ta), Color(0, 0, 0, 0), 14, 0), tr)
-		_text(tr.get_center(), tip_text, 18, Color(1, 0.96, 0.9, ta))
+		var tfs := 18
+		while tfs > 13 and font.get_string_size(tip_text, HORIZONTAL_ALIGNMENT_LEFT, -1, tfs).x > tr.size.x - 20:
+			tfs -= 1
+		_text(tr.get_center(), tip_text, tfs, Color(1, 0.96, 0.9, ta))
 	if banner_t > 0:
 		var a: float = min(1.0, banner_t)
 		_text(Vector2(vs.x * 0.5, vs.y * 0.3), banner, 28, Color(0.75, 0.15, 0.1, a), 5, Color(1, 0.96, 0.9, a))
@@ -1833,6 +1994,13 @@ func _draw_picker() -> void:
 				draw_circle(pc, 7, C_XP if is_new else (C_BROWN if filled else Color(0, 0, 0, 0.12)))
 			var tag := "新技能" if lv == 0 else "Lv%d→%d" % [lv, lv + 1]
 			_text_left(r.position + Vector2(76, 62), tag, 15, C_XP.darkened(0.25) if lv == 0 else C_BROWN)
+			var bh := _blend_hint(id)
+			if bh != "":
+				var bt := "拼配：%s" % bh
+				var bw := font.get_string_size(bt, HORIZONTAL_ALIGNMENT_LEFT, -1, 16).x
+				var bpos := Vector2(r.end.x - 20 - bw, r.position.y + 62)
+				draw_style_box(_sb(Color(C_GOLD, 0.18), C_GOLD, 8, 2), Rect2(bpos.x - 8, bpos.y - 13, bw + 16, 26))
+				_text_left(bpos, bt, 16, C_GOLD.darkened(0.25))
 			desc = d["desc"] if lv == 0 else d["ups"][lv - 1]
 		else:
 			desc = d["desc"]
@@ -1969,7 +2137,7 @@ func _export_state() -> void:
 		"mode": mode, "t": snappedf(t, 0.1), "hp": snappedf(hp, 0.1), "level": level, "xp": xp, "kills": kills,
 		"enemies": enemies.size(), "kinds": counts, "beans": beans.size(), "caf": snappedf(caf, 0.1), "jitter": jitter > 0,
 		"ppos": [snappedf(ppos.x, 0.1), snappedf(ppos.y, 0.1)], "skills": skills, "options": options,
-		"boss_hp": boss.hp if boss != null else -1, "boss_state": boss.state if boss != null else "", "total_coins": total_coins, "meta": meta, "rerolls": rerolls, "max_hp": max_hp, "heals": heals.size(), "bonus_coins": bonus_coins, "next_cust_t": snappedf(next_cust_t, 0.1), "cust_stats": cust_stats, "customers": customers.map(func(c): return {"kind": c["kind"], "need": c["need"], "have": c["have"], "ttl": snappedf(c["ttl"], 0.1), "elite": c["elite"], "born": snappedf(c["born"], 0.1)}), "run_coins": run_coins, "win": run_win,
+		"boss_hp": boss.hp if boss != null else -1, "boss_state": boss.state if boss != null else "", "total_coins": total_coins, "meta": meta, "rerolls": rerolls, "max_hp": max_hp, "heals": heals.size(), "bonus_coins": bonus_coins, "full": snappedf(caf_full_t, 0.1), "bursts": burst_count, "blends": blends.keys(), "hints": options.map(func(o): return _blend_hint(o) if SKILLS.has(o) else ""), "blend_stats": blend_stats, "onslow": enemies.filter(func(e): return e.alive and e.slow > 0 and e.kind != K.BOSS).size(), "boss_slow": boss != null and boss.slow > 0, "atk": snappedf(_atk_mult(), 0.01), "drag": pointer_down, "onscreen": enemies.filter(func(e): return e.alive and e.kind != K.BOSS and _on_screen(e.pos, 0)).size(), "next_cust_t": snappedf(next_cust_t, 0.1), "cust_stats": cust_stats, "customers": customers.map(func(c): return {"kind": c["kind"], "need": c["need"], "have": c["have"], "ttl": snappedf(c["ttl"], 0.1), "elite": c["elite"], "born": snappedf(c["born"], 0.1)}), "run_coins": run_coins, "win": run_win,
 		"fps": Engine.get_frames_per_second(), "us_update": int(perf_update), "us_draw": int(perf_draw), "vw": vs.x, "vh": vs.y, "targets": tg,
 	}
 	JavaScriptBridge.eval("window.__coffee=" + JSON.stringify(st) + ";", true)
