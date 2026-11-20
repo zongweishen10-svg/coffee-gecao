@@ -70,6 +70,11 @@ async function load(q) {
   return s;
 }
 const result = {};
+{ await send('Network.enable'); await send('Network.setCacheDisabled', { cacheDisabled: true });
+  await send('Network.emulateNetworkConditions', { offline: false, latency: 50, downloadThroughput: 4000000, uploadThroughput: 1000000 });
+  await send('Page.navigate', { url: BASE + '?cb=load' + Date.now() }); await sleep(4000); await shot('loading');
+  await send('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+  await send('Network.setCacheDisabled', { cacheDisabled: false }); }
 let s = await load('');
 result.coins_before = s.total_coins;
 await shot('title');
@@ -143,6 +148,26 @@ result.lose = { win: s.win, t: s.t, run_coins: s.run_coins, total: s.total_coins
 await tapTarget('title');
 s = await waitFor((x) => x.mode === 'title', 3000, 'title back');
 await shot('title_after');
+{ const c0 = s.total_coins, m0 = s.meta.hp;
+  await tapTarget('buy_hp');
+  s = await waitFor((x) => x.meta.hp === m0 + 1, 3000, 'buy hp');
+  result.shop = { coins_before: c0, coins_after: s.total_coins, hp_lv: s.meta.hp };
+  await shot('title_bought'); }
+if (s.meta.reroll === 0 && s.total_coins >= 50) { await tapTarget('buy_reroll'); s = await waitFor((x) => x.meta.reroll === 1, 3000, 'buy reroll'); }
+s = await load('');
+result.shop_persisted = s.meta;
+await tapTarget('start');
+s = await waitFor((x) => x.mode === 'play', 5000, 'play2');
+result.max_hp_run = s.max_hp;
+if (s.rerolls > 0) {
+  k = 0; const tR = Date.now();
+  while (Date.now() - tR < 120000) { s = await st(); if (s.mode === 'levelup') break; const [dx, dy] = dirs[k++ % 4]; await dragHold(195, 600, dx, dy, 700); }
+  await sleep(500); s = await st(); const o0 = JSON.stringify(s.options), r0 = s.rerolls;
+  await shot('reroll_before'); await tapTarget('reroll');
+  s = await waitFor((x) => x.mode === 'levelup' && x.rerolls === r0 - 1, 3000, 'reroll');
+  result.reroll = { before: o0, after: JSON.stringify(s.options), rerolls_left: s.rerolls };
+  await tapTarget('card0');
+}
 result.errors = errors;
 console.log('RESULT', JSON.stringify(result, null, 1));
 ws.close();

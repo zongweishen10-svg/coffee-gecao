@@ -26,65 +26,37 @@ body {
 	outline: none;
 }
 
-#status, #status-splash, #status-progress {
-	position: absolute;
-	left: 0;
-	right: 0;
-}
-
-#status, #status-splash {
-	top: 0;
-	bottom: 0;
-}
-
 #status {
-	background-color: #f0e3cc;
+	position: absolute;
+	inset: 0;
+	background: #efe2cc;
 	display: flex;
 	flex-direction: column;
 	justify-content: center;
 	align-items: center;
 	visibility: hidden;
+	font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+	color: #3b2416;
 }
-
-#status-splash {
-	max-height: 100%;
-	max-width: 100%;
-	margin: auto;
-}
-
-#status-splash.show-image--false {
-	display: none;
-}
-
-#status-splash.fullsize--true {
-	height: 100%;
-	width: 100%;
-	object-fit: contain;
-}
-
-#status-splash.use-filter--false {
-	image-rendering: pixelated;
-}
-
-#status-progress, #status-notice {
-	display: none;
-}
-
-#status-progress {
-	bottom: 10%;
-	width: 50%;
-	margin: 0 auto;
-}
-
+#status-splash { display: none; }
+#cup { width: 140px; height: 140px; }
+#cup .steam { fill: none; stroke: #6b4226; stroke-width: 5; stroke-linecap: round; opacity: 0.45; animation: rise 1.8s ease-in-out infinite; }
+#cup .steam.s2 { animation-delay: 0.6s; }
+#cup .steam.s3 { animation-delay: 1.2s; }
+@keyframes rise { 0% { transform: translateY(8px); opacity: 0; } 40% { opacity: 0.5; } 100% { transform: translateY(-10px); opacity: 0; } }
+#load-title { font-size: 30px; font-weight: 800; margin: 14px 0 4px; letter-spacing: 2px; }
+#load-text { font-size: 18px; color: #6b4226; margin-bottom: 18px; }
+#status-progress { display: none; width: 62%; max-width: 280px; height: 14px; border-radius: 7px; background: rgba(59,36,22,0.15); overflow: hidden; }
+#bar-fill { height: 100%; width: 3%; background: #7a4a26; border-radius: 7px; transition: width 0.25s; }
+#load-pct { font-size: 14px; color: #6b4226; margin-top: 8px; min-height: 18px; }
 #status-notice {
-	background-color: #5b3943;
-	border-radius: 0.5rem;
-	border: 1px solid #9b3943;
-	color: #e0e0e0;
-	font-family: 'Noto Sans', 'Droid Sans', Arial, sans-serif;
-	line-height: 1.3;
+	display: none;
+	background-color: #fff6e6;
+	border-radius: 0.75rem;
+	border: 2px solid #6b4226;
+	color: #3b2416;
+	line-height: 1.4;
 	margin: 0 2rem;
-	overflow: hidden;
 	padding: 1rem;
 	text-align: center;
 	z-index: 1;
@@ -105,13 +77,25 @@ body {
 
 		<div id="status">
 			<img id="status-splash" class="show-image--false fullsize--true use-filter--true" src="index.png" alt="">
-			<progress id="status-progress"></progress>
+			<svg id="cup" viewBox="0 0 140 140" aria-hidden="true">
+				<path class="steam s1" d="M52 38 q-8 -10 0 -20 q8 -10 0 -18" />
+				<path class="steam s2" d="M70 38 q-8 -10 0 -20 q8 -10 0 -18" />
+				<path class="steam s3" d="M88 38 q-8 -10 0 -20 q8 -10 0 -18" />
+				<path d="M112 70 a16 16 0 0 1 0 32" fill="none" stroke="#6b4226" stroke-width="9" />
+				<circle cx="70" cy="86" r="44" fill="#fff6e6" stroke="#6b4226" stroke-width="6" />
+				<circle cx="70" cy="86" r="31" fill="#7a4a26" />
+				<path d="M70 102 C52 88 56 74 64 74 C68 74 70 78 70 80 C70 78 72 74 76 74 C84 74 88 88 70 102 Z" fill="#fff1e0" />
+			</svg>
+			<div id="load-title">咖啡割草</div>
+			<div id="load-text">正在磨豆…</div>
+			<div id="status-progress"><div id="bar-fill"></div></div>
+			<div id="load-pct"></div>
 			<div id="status-notice"></div>
 		</div>
 
 		<script src="index.js"></script>
 		<script>
-const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":true,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":150896,"index.wasm":39514754},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":true,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":177168,"index.wasm":39514754},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
 const GODOT_THREADS_ENABLED = false;
 const engine = new Engine(GODOT_CONFIG);
 
@@ -119,6 +103,9 @@ const engine = new Engine(GODOT_CONFIG);
 	const statusOverlay = document.getElementById('status');
 	const statusProgress = document.getElementById('status-progress');
 	const statusNotice = document.getElementById('status-notice');
+	const barFill = document.getElementById('bar-fill');
+	const loadPct = document.getElementById('load-pct');
+	const loadText = document.getElementById('load-text');
 
 	let initializing = true;
 	let statusMode = '';
@@ -134,6 +121,7 @@ const engine = new Engine(GODOT_CONFIG);
 		}
 		statusOverlay.style.visibility = 'visible';
 		statusProgress.style.display = mode === 'progress' ? 'block' : 'none';
+		loadPct.style.display = mode === 'progress' ? 'block' : 'none';
 		statusNotice.style.display = mode === 'notice' ? 'block' : 'none';
 		statusMode = mode;
 	}
@@ -202,11 +190,12 @@ const engine = new Engine(GODOT_CONFIG);
 		engine.startGame({
 			'onProgress': function (current, total) {
 				if (current > 0 && total > 0) {
-					statusProgress.value = current;
-					statusProgress.max = total;
-				} else {
-					statusProgress.removeAttribute('value');
-					statusProgress.removeAttribute('max');
+					const p = Math.min(100, Math.floor((current / total) * 100));
+					barFill.style.width = Math.max(3, p) + '%';
+					loadPct.textContent = p >= 100 ? '' : p + '%';
+					if (p >= 100) {
+						loadText.textContent = '正在冲煮…';
+					}
 				}
 			},
 		}).then(() => {
