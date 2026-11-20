@@ -1,0 +1,9 @@
+{
+ "name": "index.wasm",
+ "size": 39514754,
+ "sha256": "fc74679e3b97f76878947fcd4fbe1268cbfa6188182a2e33bbc3f5dc9bfa57d0",
+ "template_url": "https://github.com/godotengine/godot/releases/download/4.7.2-stable/Godot_v4.7.2-stable_export_templates.tpz",
+ "template_zip": "templates/web_nothreads_release.zip",
+ "template_member": "godot.wasm",
+ "fallback_url": "https://zongweishen10-svg.github.io/alchemy-3x3-reactor/index.wasm"
+}
