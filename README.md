@@ -19,3 +19,5 @@ godot --headless --export-release "Web" ../index.html
 测试用 URL 参数：`t` 开局秒数、`god=1` 无敌、`hp` 开局血量、`bosshp` Boss 血量、`auto=1` 自动游玩（1 会躲怪的 bot，2 粗心绕圈，3 站着不动）、`order=kill|bean|elite` 指定顾客订单、`pacifist=1` 不开火（测订单超时）、`caf` 开局咖啡因、`skills=ice:3,espresso:2` 开局技能等级、`offer=espresso` 选卡必出。验收测试：`tools_web/order_test.mjs`、`burst_test.mjs`、`blend_test.mjs`。
 
 无头平衡模拟：`cd proto && godot --headless -- --auto=1 --steps=30 --quit=1 --seed=7`
+
+测试面板（手机上测试用）：标题页连点标题「咖啡割草」5 下，或局内连点顶部计时器 5 下（会暂停）。用过测试功能的局 HUD 左上角显示「测试」。验收脚本：`tools_web/admin_test.mjs`。

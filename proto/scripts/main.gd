@@ -127,6 +127,13 @@ var blends := {}              # 已激活的拼配 id
 var kettle_pts: Array = []    # 本帧每股热水的位置（手冲套装用）
 var blend_stats := {"slow_hits": 0, "slashes": 0, "blocks": 0, "pour_hits": 0}
 var opt_skills := {}          # 测试参数：开局技能等级
+# 隐藏测试面板（标题连点 5 下 / 局内连点计时器 5 下）
+var adm_prev := "title"       # 打开面板前的 mode，关掉时回去
+var adm_page := "main"        # main / skill
+var adm_taps := 0
+var adm_tap_ms := 0
+var adm_confirm_until := 0.0  # 重置存档二次确认的截止时间
+var run_cheat := false        # 本局用过测试功能（HUD 显示「测试」）
 var opt_offer: Array = []     # 测试参数：选卡必出的技能
 var burst_tip_done := false   # 本次打开游戏是否已经讲过满槽二选一
 var in_puddle := false
@@ -342,6 +349,7 @@ func _start_run() -> void:
 			skills[k] = int(opt_skills[k])
 	blends = {}
 	kettle_pts = []
+	run_cheat = false
 	blend_stats = {"slow_hits": 0, "slashes": 0, "blocks": 0, "pour_hits": 0}
 	if not opt_skills.is_empty():
 		_check_blends()   # 测试参数直接给了双 Lv3 时立刻成杯
@@ -990,6 +998,11 @@ func _draw_customers() -> void:
 		var vr := ppos.x + vs.x * 0.5 - 6.0 - w
 		if vr > vl:
 			br.position.x = clampf(br.position.x, vl, vr)
+		# 也别钻到顶部 HUD（计时器/订单行）底下
+		var vt := ppos.y - vs.y * 0.5 + 132.0
+		if br.position.y < vt:
+			bp.y += vt - br.position.y
+			br.position.y = vt
 		draw_style_box(_sb(Color(1, 1, 1, 0.95), C_BROWN, 12, 2), br)
 		draw_colored_polygon(PackedVector2Array([bp + Vector2(-7, 16), bp + Vector2(7, 16), bp + Vector2(0, 26)]), C_BROWN)
 		var ic := Vector2(br.position.x + 18, bp.y)
@@ -1396,6 +1409,8 @@ func _pointer(pressed: bool, pos: Vector2) -> void:
 		press_target = ""
 		_activate("burst")
 		return
+	if pressed and _adm_secret_tap(pos):
+		return
 	if pressed:
 		press_target = _target_at(pos)
 		if mode == "levelup" and picker_age < 0.5:
@@ -1412,6 +1427,141 @@ func _pointer(pressed: bool, pos: Vector2) -> void:
 		if tg != "" and tg == press_target:
 			_activate(tg)
 		press_target = ""
+
+
+func _adm_secret_tap(pos: Vector2) -> bool:
+	# 标题页连点标题 5 下、局内连点计时器 5 下 → 打开测试面板
+	var hit := false
+	if mode == "title":
+		hit = Rect2(vs.x * 0.5 - 120, vs.y * 0.235 - 38, 240, 76).has_point(pos)
+	elif mode == "play":
+		hit = Rect2(vs.x * 0.5 - 60, 46, 120, 48).has_point(pos)
+	if not hit:
+		adm_taps = 0
+		return false
+	var now := Time.get_ticks_msec()
+	adm_taps = adm_taps + 1 if now - adm_tap_ms < 700 else 1
+	adm_tap_ms = now
+	if adm_taps >= 5:
+		adm_taps = 0
+		adm_prev = mode
+		adm_page = "main"
+		adm_confirm_until = 0.0
+		mode = "admin"
+		pointer_down = false
+		press_target = ""
+		print("COFFEE_ADMIN open from=", adm_prev)
+		return true
+	return false
+
+
+func _adm_need_run() -> void:
+	# 在标题页点了局内功能：先开一局（面板保持打开）
+	if adm_prev != "play":
+		_start_run()
+		adm_prev = "play"
+		mode = "admin"
+	run_cheat = true
+
+
+func _adm_set_skill(id: String, lv: int) -> void:
+	var old: int = skills.get(id, 0)
+	if lv <= old:
+		return
+	skills[id] = min(lv, MAX_LV)
+	if id == "foam" and old == 0:
+		shield = 1
+		shield_cd = _foam_cd()
+
+
+func _adm_action(name: String) -> void:
+	print("COFFEE_ADMIN ", name)
+	match name:
+		"adm_coins":
+			total_coins += 500
+			_save()
+		"adm_god":
+			opt_god = not opt_god
+		"adm_next_min":
+			_adm_need_run()
+			if t < RUN_LEN:
+				_adm_jump((floorf(t / 60.0) + 1.0) * 60.0)
+		"adm_boss":
+			_adm_need_run()
+			if t < RUN_LEN - 5.0:
+				_adm_jump(RUN_LEN - 5.0)
+		"adm_caf":
+			_adm_need_run()
+			if caf_full_t <= 0:
+				jitter = 0.0
+				caf = CAF_MAX
+				_on_caffeine_full()
+		"adm_lvup":
+			_adm_need_run()
+			mode = "play"
+			pending_levels += 1
+			_open_picker()
+		"adm_maxall":
+			_adm_need_run()
+			for id in SKILL_ORDER:
+				_adm_set_skill(id, MAX_LV)
+			_check_blends()
+		"adm_skillpage":
+			adm_page = "skill"
+		"adm_back":
+			adm_page = "main"
+		"adm_bl_americano", "adm_bl_latteart", "adm_bl_pourover":
+			_adm_need_run()
+			var b: Dictionary = BLENDS[name.substr(7)]
+			_adm_set_skill(b["a"], 3)
+			_adm_set_skill(b["b"], 3)
+			_check_blends()
+		"adm_cust", "adm_cust_elite":
+			_adm_need_run()
+			if boss != null or t >= RUN_LEN:
+				banner = "Boss 战不来客人"
+				banner_t = 1.5
+			else:
+				for c in customers:
+					if c["elite"] and c["enemy"] != null:
+						(c["enemy"] as Enemy).alive = false
+				customers.clear()
+				var keep := opt_order
+				opt_order = "elite" if name == "adm_cust_elite" else ("kill" if cust_idx % 2 == 0 else "bean")
+				_spawn_customer()
+				opt_order = keep
+		"adm_reset":
+			if clock < adm_confirm_until:
+				total_coins = 0
+				best_time = 0.0
+				seen_jitter_tip = false
+				burst_unlocked = false
+				for k in meta:
+					meta[k] = 0
+				_save()
+				adm_confirm_until = 0.0
+				adm_prev = "title"
+				mode = "title"
+				print("COFFEE_ADMIN save_reset")
+			else:
+				adm_confirm_until = clock + 3.0
+		"adm_close":
+			mode = adm_prev
+			adm_page = "main"
+		_:
+			if name.begins_with("adm_sk_"):
+				_adm_need_run()
+				var id := name.substr(7)
+				_adm_set_skill(id, int(skills.get(id, 0)) + 1)
+				_check_blends()
+
+
+func _adm_jump(nt: float) -> void:
+	# 跳时间：不补刷被跳过的整分钟怪潮，顾客按新时间重新排
+	t = nt
+	minute_waves_done = int(t / 60.0)
+	if customers.is_empty():
+		next_cust_t = max(next_cust_t, t + 5.0)
 
 
 func _burst_rect() -> Rect2:
@@ -1459,7 +1609,9 @@ func _activate(name: String) -> void:
 				rerolls -= 1
 				_open_picker()
 		_:
-			if mode == "title" and name.begins_with("buy_"):
+			if mode == "admin" and name.begins_with("adm_"):
+				_adm_action(name)
+			elif mode == "title" and name.begins_with("buy_"):
 				_buy(name.substr(4))
 			elif mode == "levelup" and name.begins_with("card") and picker_age > 0.3:
 				_pick(int(name.substr(4)))
@@ -1502,12 +1654,20 @@ func _draw() -> void:
 
 func _draw_all() -> void:
 	targets.clear()
-	if mode == "title":
+	if mode == "title" or (mode == "admin" and adm_prev == "title"):
 		_draw_title()
+		if opt_god:
+			_draw_cheat_mark()
+		if mode == "admin":
+			_draw_admin()
 		return
 	_draw_world()
 	_draw_hud()
+	if opt_god or run_cheat:
+		_draw_cheat_mark()
 	match mode:
+		"admin":
+			_draw_admin()
 		"levelup":
 			_draw_picker()
 		"pause":
@@ -1516,6 +1676,59 @@ func _draw_all() -> void:
 			_text(vs * Vector2(0.5, 0.45) + Vector2(0, 46), "点一下继续", 20, C_CREAM)
 		"result":
 			_draw_result()
+
+
+func _draw_cheat_mark() -> void:
+	var r := Rect2(12, 132, 46, 22)
+	draw_style_box(_sb(Color(0.75, 0.15, 0.1, 0.85), Color(0, 0, 0, 0), 8, 0), r)
+	_text(r.get_center(), "测试", 13, C_CREAM)
+
+
+func _adm_btn(name: String, r: Rect2, label: String, hot := false) -> void:
+	draw_style_box(_sb(C_RED if hot else C_BROWN, C_DARK, 14, 2), r)
+	_text(r.get_center(), label, 19, C_CREAM)
+	targets.append({"name": name, "rect": r})
+
+
+func _draw_admin() -> void:
+	targets.clear()   # 面板下面的按钮一律不响应
+	draw_rect(Rect2(Vector2.ZERO, vs), Color(0.1, 0.06, 0.03, 0.72))
+	var items: Array = []
+	if adm_page == "skill":
+		for id in SKILL_ORDER:
+			var lv: int = skills.get(id, 0) if adm_prev == "play" else (1 if id == "espresso" else 0)
+			var lab := "%s 已满" % SKILLS[id]["name"] if lv >= MAX_LV else "%s %d→%d" % [SKILLS[id]["name"], lv, lv + 1]
+			items.append(["adm_sk_" + id, lab, false])
+		items.append(["adm_back", "返回", false])
+	else:
+		items = [
+			["adm_coins", "金币+500", false], ["adm_god", "无敌：%s" % ("开" if opt_god else "关"), opt_god],
+			["adm_next_min", "跳到下一分钟", false], ["adm_boss", "跳到9:55", false],
+			["adm_caf", "咖啡因加满", false], ["adm_lvup", "立即升级", false],
+			["adm_maxall", "技能全满", false], ["adm_skillpage", "选技能+1", false],
+			["adm_bl_americano", "凑冰美式", false], ["adm_bl_latteart", "凑拿铁", false],
+			["adm_bl_pourover", "凑手冲套装", false], ["adm_cust", "刷普通顾客", false],
+			["adm_cust_elite", "刷精英顾客", false],
+			["adm_reset", "再点一次确认" if clock < adm_confirm_until else "重置存档", clock < adm_confirm_until],
+		]
+	var rows := ceili(items.size() / 2.0)
+	var ph := 80.0 + rows * 64.0 + 6.0 + 54.0 + 18.0
+	var pr := Rect2(12, max(40.0, (vs.y - ph) * 0.4), vs.x - 24, ph)
+	draw_style_box(sb_panel, pr)
+	_text(Vector2(vs.x * 0.5, pr.position.y + 30), "测试面板", 24, C_DARK)
+	var info := "金币 %d · 无敌%s" % [total_coins, "开" if opt_god else "关"]
+	if adm_prev == "play":
+		info = "%s · Lv%d · 金币 %d" % [_fmt_time(min(t, RUN_LEN)), level, total_coins]
+	_text(Vector2(vs.x * 0.5, pr.position.y + 58), info, 15, C_BROWN)
+	var gx := pr.position.x + 14
+	var gw := (pr.size.x - 28 - 10) * 0.5
+	var bh := 54.0
+	var y := pr.position.y + 80
+	for i in items.size():
+		var r := Rect2(gx + (i % 2) * (gw + 10), y + int(i / 2) * (bh + 10), gw, bh)
+		_adm_btn(items[i][0], r, items[i][1], items[i][2])
+	var cy: float = y + ceilf(items.size() / 2.0) * (bh + 10) + 6
+	_adm_btn("adm_close", Rect2(gx, cy, pr.size.x - 28, bh), "关闭")
 
 
 func _text(center: Vector2, s: String, size: int, col: Color, outline := 0, ocol := C_DARK) -> void:
@@ -2137,7 +2350,7 @@ func _export_state() -> void:
 		"mode": mode, "t": snappedf(t, 0.1), "hp": snappedf(hp, 0.1), "level": level, "xp": xp, "kills": kills,
 		"enemies": enemies.size(), "kinds": counts, "beans": beans.size(), "caf": snappedf(caf, 0.1), "jitter": jitter > 0,
 		"ppos": [snappedf(ppos.x, 0.1), snappedf(ppos.y, 0.1)], "skills": skills, "options": options,
-		"boss_hp": boss.hp if boss != null else -1, "boss_state": boss.state if boss != null else "", "total_coins": total_coins, "meta": meta, "rerolls": rerolls, "max_hp": max_hp, "heals": heals.size(), "bonus_coins": bonus_coins, "full": snappedf(caf_full_t, 0.1), "bursts": burst_count, "blends": blends.keys(), "hints": options.map(func(o): return _blend_hint(o) if SKILLS.has(o) else ""), "blend_stats": blend_stats, "onslow": enemies.filter(func(e): return e.alive and e.slow > 0 and e.kind != K.BOSS).size(), "boss_slow": boss != null and boss.slow > 0, "atk": snappedf(_atk_mult(), 0.01), "drag": pointer_down, "onscreen": enemies.filter(func(e): return e.alive and e.kind != K.BOSS and _on_screen(e.pos, 0)).size(), "next_cust_t": snappedf(next_cust_t, 0.1), "cust_stats": cust_stats, "customers": customers.map(func(c): return {"kind": c["kind"], "need": c["need"], "have": c["have"], "ttl": snappedf(c["ttl"], 0.1), "elite": c["elite"], "born": snappedf(c["born"], 0.1)}), "run_coins": run_coins, "win": run_win,
+		"boss_hp": boss.hp if boss != null else -1, "boss_state": boss.state if boss != null else "", "total_coins": total_coins, "meta": meta, "rerolls": rerolls, "max_hp": max_hp, "heals": heals.size(), "bonus_coins": bonus_coins, "full": snappedf(caf_full_t, 0.1), "bursts": burst_count, "adm": adm_page if mode == "admin" else "", "god": opt_god, "cheat": run_cheat, "blends": blends.keys(), "hints": options.map(func(o): return _blend_hint(o) if SKILLS.has(o) else ""), "blend_stats": blend_stats, "onslow": enemies.filter(func(e): return e.alive and e.slow > 0 and e.kind != K.BOSS).size(), "boss_slow": boss != null and boss.slow > 0, "atk": snappedf(_atk_mult(), 0.01), "drag": pointer_down, "onscreen": enemies.filter(func(e): return e.alive and e.kind != K.BOSS and _on_screen(e.pos, 0)).size(), "next_cust_t": snappedf(next_cust_t, 0.1), "cust_stats": cust_stats, "customers": customers.map(func(c): return {"kind": c["kind"], "need": c["need"], "have": c["have"], "ttl": snappedf(c["ttl"], 0.1), "elite": c["elite"], "born": snappedf(c["born"], 0.1)}), "run_coins": run_coins, "win": run_win,
 		"fps": Engine.get_frames_per_second(), "us_update": int(perf_update), "us_draw": int(perf_draw), "vw": vs.x, "vh": vs.y, "targets": tg,
 	}
 	JavaScriptBridge.eval("window.__coffee=" + JSON.stringify(st) + ";", true)
