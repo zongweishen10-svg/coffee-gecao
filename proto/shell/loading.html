@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0">
+		<title>$GODOT_PROJECT_NAME</title>
+		<style>
+html, body, #canvas {
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+
+body {
+	color: white;
+	background-color: black;
+	overflow: hidden;
+	touch-action: none;
+}
+
+#canvas {
+	display: block;
+}
+
+#canvas:focus {
+	outline: none;
+}
+
+#status {
+	position: absolute;
+	inset: 0;
+	background: #efe2cc;
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+	align-items: center;
+	visibility: hidden;
+	font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+	color: #3b2416;
+}
+#status-splash { display: none; }
+#cup { width: 140px; height: 140px; }
+#cup .steam { fill: none; stroke: #6b4226; stroke-width: 5; stroke-linecap: round; opacity: 0.45; animation: rise 1.8s ease-in-out infinite; }
+#cup .steam.s2 { animation-delay: 0.6s; }
+#cup .steam.s3 { animation-delay: 1.2s; }
+@keyframes rise { 0% { transform: translateY(8px); opacity: 0; } 40% { opacity: 0.5; } 100% { transform: translateY(-10px); opacity: 0; } }
+#load-title { font-size: 30px; font-weight: 800; margin: 14px 0 4px; letter-spacing: 2px; }
+#load-text { font-size: 18px; color: #6b4226; margin-bottom: 18px; }
+#status-progress { display: none; width: 62%; max-width: 280px; height: 14px; border-radius: 7px; background: rgba(59,36,22,0.15); overflow: hidden; }
+#bar-fill { height: 100%; width: 3%; background: #7a4a26; border-radius: 7px; transition: width 0.25s; }
+#load-pct { font-size: 14px; color: #6b4226; margin-top: 8px; min-height: 18px; }
+#status-notice {
+	display: none;
+	background-color: #fff6e6;
+	border-radius: 0.75rem;
+	border: 2px solid #6b4226;
+	color: #3b2416;
+	line-height: 1.4;
+	margin: 0 2rem;
+	padding: 1rem;
+	text-align: center;
+	z-index: 1;
+}
+		</style>
+		$GODOT_HEAD_INCLUDE
+	</head>
+	<body>
+		<canvas id="canvas">
+			Your browser does not support the canvas tag.
+		</canvas>
+
+		<noscript>
+			Your browser does not support JavaScript.
+		</noscript>
+
+		<div id="status">
+			<img id="status-splash" class="$GODOT_SPLASH_CLASSES" src="$GODOT_SPLASH" alt="">
+			<svg id="cup" viewBox="0 0 140 140" aria-hidden="true">
+				<path class="steam s1" d="M52 38 q-8 -10 0 -20 q8 -10 0 -18" />
+				<path class="steam s2" d="M70 38 q-8 -10 0 -20 q8 -10 0 -18" />
+				<path class="steam s3" d="M88 38 q-8 -10 0 -20 q8 -10 0 -18" />
+				<path d="M112 70 a16 16 0 0 1 0 32" fill="none" stroke="#6b4226" stroke-width="9" />
+				<circle cx="70" cy="86" r="44" fill="#fff6e6" stroke="#6b4226" stroke-width="6" />
+				<circle cx="70" cy="86" r="31" fill="#7a4a26" />
+				<path d="M70 102 C52 88 56 74 64 74 C68 74 70 78 70 80 C70 78 72 74 76 74 C84 74 88 88 70 102 Z" fill="#fff1e0" />
+			</svg>
+			<div id="load-title">咖啡割草</div>
+			<div id="load-text">正在磨豆…</div>
+			<div id="status-progress"><div id="bar-fill"></div></div>
+			<div id="load-pct"></div>
+			<div id="status-notice"></div>
+		</div>
+
+		<script src="$GODOT_URL"></script>
+		<script>
+const GODOT_CONFIG = $GODOT_CONFIG;
+const GODOT_THREADS_ENABLED = $GODOT_THREADS_ENABLED;
+const engine = new Engine(GODOT_CONFIG);
+
+(function () {
+	const statusOverlay = document.getElementById('status');
+	const statusProgress = document.getElementById('status-progress');
+	const statusNotice = document.getElementById('status-notice');
+	const barFill = document.getElementById('bar-fill');
+	const loadPct = document.getElementById('load-pct');
+	const loadText = document.getElementById('load-text');
+
+	let initializing = true;
+	let statusMode = '';
+
+	function setStatusMode(mode) {
+		if (statusMode === mode || !initializing) {
+			return;
+		}
+		if (mode === 'hidden') {
+			statusOverlay.remove();
+			initializing = false;
+			return;
+		}
+		statusOverlay.style.visibility = 'visible';
+		statusProgress.style.display = mode === 'progress' ? 'block' : 'none';
+		loadPct.style.display = mode === 'progress' ? 'block' : 'none';
+		statusNotice.style.display = mode === 'notice' ? 'block' : 'none';
+		statusMode = mode;
+	}
+
+	function setStatusNotice(text) {
+		while (statusNotice.lastChild) {
+			statusNotice.removeChild(statusNotice.lastChild);
+		}
+		const lines = text.split('\n');
+		lines.forEach((line) => {
+			statusNotice.appendChild(document.createTextNode(line));
+			statusNotice.appendChild(document.createElement('br'));
+		});
+	}
+
+	function displayFailureNotice(err) {
+		console.error(err);
+		if (err instanceof Error) {
+			setStatusNotice(err.message);
+		} else if (typeof err === 'string') {
+			setStatusNotice(err);
+		} else {
+			setStatusNotice('An unknown error occurred.');
+		}
+		setStatusMode('notice');
+		initializing = false;
+	}
+
+	const missing = Engine.getMissingFeatures({
+		threads: GODOT_THREADS_ENABLED,
+	});
+
+	if (missing.length !== 0) {
+		if (GODOT_CONFIG['serviceWorker'] && GODOT_CONFIG['ensureCrossOriginIsolationHeaders'] && 'serviceWorker' in navigator) {
+			let serviceWorkerRegistrationPromise;
+			try {
+				serviceWorkerRegistrationPromise = navigator.serviceWorker.getRegistration();
+			} catch (err) {
+				serviceWorkerRegistrationPromise = Promise.reject(new Error('Service worker registration failed.'));
+			}
+			// There's a chance that installing the service worker would fix the issue
+			Promise.race([
+				serviceWorkerRegistrationPromise.then((registration) => {
+					if (registration != null) {
+						return Promise.reject(new Error('Service worker already exists.'));
+					}
+					return registration;
+				}).then(() => engine.installServiceWorker()),
+				// For some reason, `getRegistration()` can stall
+				new Promise((resolve) => {
+					setTimeout(() => resolve(), 2000);
+				}),
+			]).then(() => {
+				// Reload if there was no error.
+				window.location.reload();
+			}).catch((err) => {
+				console.error('Error while registering service worker:', err);
+			});
+		} else {
+			// Display the message as usual
+			const missingMsg = 'Error\nThe following features required to run Godot projects on the Web are missing:\n';
+			displayFailureNotice(missingMsg + missing.join('\n'));
+		}
+	} else {
+		setStatusMode('progress');
+		engine.startGame({
+			'onProgress': function (current, total) {
+				if (current > 0 && total > 0) {
+					const p = Math.min(100, Math.floor((current / total) * 100));
+					barFill.style.width = Math.max(3, p) + '%';
+					loadPct.textContent = p >= 100 ? '' : p + '%';
+					if (p >= 100) {
+						loadText.textContent = '正在冲煮…';
+					}
+				}
+			},
+		}).then(() => {
+			setStatusMode('hidden');
+		}, displayFailureNotice);
+	}
+}());
+		</script>
+	</body>
+</html>

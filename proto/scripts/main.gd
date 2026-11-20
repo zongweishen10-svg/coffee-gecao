@@ -3,13 +3,18 @@ extends Node2D
 
 const SAVE_PATH := "user://coffee_save.cfg"
 const RUN_LEN := 600.0
-const MAX_ENEMIES := 170
+const MAX_ENEMIES := 120
 const MAX_BEANS := 220
 const MAX_BULLETS := 90
 const MAX_FLOATS := 18
 const PR := 15.0            # 玩家半径
 const PLAYER_SPEED := 165.0
-const PLAYER_MAX_HP := 100.0
+const PLAYER_MAX_HP := 100.0   # 基础值；局外「生命上限」每级 +5
+const HEAL_DROP_CHANCE := 0.015  # 击杀掉回血豆的概率
+const HEAL_DROP_AMOUNT := 8.0
+const HEAL_OFFER_CHANCE := 0.15  # 升级时热拿铁占一个选项的概率
+const BOSS_HP_BASE := 1200.0
+const BOSS_HP_PER_LV := 60.0     # Boss 血量 = 1200 + 60×进场等级
 const CAF_MAX := 45.0       # 咖啡因槽上限（颗豆子）
 const JITTER_TIME := 3.0    # 手抖时长
 const MAX_LV := 5
@@ -80,6 +85,9 @@ var clock := 0.0      # 真实累计（动画用）
 var ppos := Vector2.ZERO
 var facing := Vector2.UP
 var hp := PLAYER_MAX_HP
+var max_hp := PLAYER_MAX_HP
+var heals: Array = []
+var rerolls := 0
 var iframes := 0.0
 var hurt_flash := 0.0
 var level := 1
@@ -126,6 +134,12 @@ var shield_cd := 0.0
 
 # 局外
 var total_coins := 0
+var meta := {"hp": 0, "magnet": 0, "reroll": 0}
+const SHOP := [
+	{"id": "hp", "name": "生命上限", "icon": "血", "color": "#c0392b", "desc": "开局生命上限多加5点。", "max": 5, "base": 30, "step": 20},
+	{"id": "magnet", "name": "磁铁范围", "icon": "磁", "color": "#4f9bc7", "desc": "吸豆子的范围变大一成。", "max": 5, "base": 30, "step": 20},
+	{"id": "reroll", "name": "重随一次", "icon": "换", "color": "#8a6a4f", "desc": "每局能重随一次升级选项。", "max": 3, "base": 50, "step": 40},
+]
 var best_time := 0.0
 
 # 输入
@@ -141,6 +155,12 @@ var targets: Array = []
 var opt_start_t := 0.0
 var opt_god := false
 var opt_auto := false
+var opt_bot := 1
+var picker_gap := 0.0
+var boss_log_t := 0.0
+var tip_text := ""
+var tip_t := 0.0
+var seen_jitter_tip := false
 var opt_steps := 1
 var opt_quit := false
 var opt_hp := -1.0
@@ -199,7 +219,9 @@ func _parse_args() -> void:
 		match k:
 			"t": opt_start_t = float(v)
 			"god": opt_god = v == "1"
-			"auto": opt_auto = v == "1"
+			"auto":
+				opt_auto = v != "0"
+				opt_bot = int(v)
 			"steps": opt_steps = max(1, int(v))
 			"quit": opt_quit = v == "1"
 			"seed": rng.seed = int(v)
@@ -208,19 +230,44 @@ func _parse_args() -> void:
 
 
 func _load_save() -> void:
+	if OS.has_feature("web"):
+		var raw = JavaScriptBridge.eval("localStorage.getItem('coffee_gecao_save') || ''", true)
+		var d = JSON.parse_string(str(raw)) if str(raw) != "" else null
+		if d is Dictionary:
+			total_coins = int(d.get("coins", 0))
+			best_time = float(d.get("best_time", 0.0))
+			burst_unlocked = bool(d.get("burst_unlocked", false))
+			seen_jitter_tip = bool(d.get("seen_jitter_tip", false))
+			var sh = d.get("shop", {})
+			if sh is Dictionary:
+				for k in meta:
+					meta[k] = int(sh.get(k, 0))
+			return
 	var cf := ConfigFile.new()
 	if cf.load(SAVE_PATH) == OK:
 		total_coins = int(cf.get_value("meta", "coins", 0))
 		best_time = float(cf.get_value("meta", "best_time", 0.0))
 		burst_unlocked = bool(cf.get_value("meta", "burst_unlocked", false))
+		seen_jitter_tip = bool(cf.get_value("meta", "seen_jitter_tip", false))
+		for k in meta:
+			meta[k] = int(cf.get_value("shop", k, 0))
 
 
 func _save() -> void:
+	if opt_auto:
+		return
 	var cf := ConfigFile.new()
 	cf.set_value("meta", "coins", total_coins)
 	cf.set_value("meta", "best_time", best_time)
 	cf.set_value("meta", "burst_unlocked", burst_unlocked)
+	cf.set_value("meta", "seen_jitter_tip", seen_jitter_tip)
+	for k in meta:
+		cf.set_value("shop", k, meta[k])
 	cf.save(SAVE_PATH)
+	if OS.has_feature("web"):
+		# 网页版另存一份到 localStorage（同步写入，刷新页面也不会丢）
+		var d := {"coins": total_coins, "best_time": best_time, "burst_unlocked": burst_unlocked, "seen_jitter_tip": seen_jitter_tip, "shop": meta}
+		JavaScriptBridge.eval("localStorage.setItem('coffee_gecao_save', %s);" % JSON.stringify(JSON.stringify(d)), true)
 
 
 # ================= 开局 / 结束 =================
@@ -228,7 +275,12 @@ func _start_run() -> void:
 	t = opt_start_t
 	ppos = Vector2.ZERO
 	facing = Vector2.UP
-	hp = PLAYER_MAX_HP if opt_hp <= 0 else opt_hp
+	max_hp = PLAYER_MAX_HP + 5.0 * meta["hp"]
+	hp = max_hp if opt_hp <= 0 else opt_hp
+	rerolls = meta["reroll"]
+	picker_gap = 0.0
+	tip_t = 0.0
+	heals.clear()
 	iframes = 0.0
 	level = 1
 	xp = 0
@@ -296,6 +348,8 @@ func _process(delta: float) -> void:
 	floats = floats.filter(func(f): return f["t"] > 0)
 	if banner_t > 0:
 		banner_t -= dt
+	if tip_t > 0 and mode == "play":
+		tip_t -= dt
 	if OS.has_feature("web"):
 		state_timer -= delta
 		if state_timer <= 0:
@@ -317,7 +371,8 @@ func _update(dt: float) -> void:
 	_update_projectiles(dt)
 	_update_beans(dt)
 	enemies = enemies.filter(func(e): return e.alive)
-	if mode == "play" and pending_levels > 0:
+	picker_gap -= dt
+	if mode == "play" and pending_levels > 0 and picker_gap <= 0:
 		_open_picker()
 
 
@@ -352,6 +407,11 @@ func _update_player(dt: float) -> void:
 
 
 func _bot_dir() -> Vector2:
+	if opt_bot == 3:
+		return Vector2.ZERO
+	if opt_bot == 2:
+		# 粗心玩家：慢慢绕大圈，不躲怪，只顺路吃豆
+		return Vector2(cos(t * 0.25), sin(t * 0.25)) * 0.6
 	var away := Vector2.ZERO
 	for e in enemies:
 		var d := ppos - e.pos
@@ -399,6 +459,11 @@ func _on_caffeine_full() -> void:
 		caf = 0.0
 	else:
 		jitter = JITTER_TIME
+		if not seen_jitter_tip:
+			seen_jitter_tip = true
+			tip_text = "咖啡喝多了：攻速翻倍，子弹乱喷3秒！"
+			tip_t = 3.5
+			_save()
 		_float(ppos + Vector2(0, -40), "手抖！", C_RED, 22)
 		print("COFFEE_JITTER t=%.1f" % t)
 
@@ -417,7 +482,7 @@ func _espresso_burst() -> void:
 # ================= 刷怪 =================
 func _spawn_director(dt: float) -> void:
 	if t < RUN_LEN:
-		var rate := 1.1 + t * 0.03
+		var rate := 0.5 + t * 0.015
 		spawn_acc += dt * rate
 		while spawn_acc >= 1.0:
 			spawn_acc -= 1.0
@@ -429,28 +494,38 @@ func _spawn_director(dt: float) -> void:
 			print("COFFEE_MIN %d lv=%d kills=%d hp=%.0f enemies=%d beans=%d skills=%s" % [m, level, kills, hp, enemies.size(), beans.size(), JSON.stringify(skills)])
 			_minute_wave(m)
 	else:
+		if boss != null and opt_auto and t - boss_log_t >= 20.0:
+			boss_log_t = t
+			print("COFFEE_BOSSLOG t=%.0f boss_hp=%.0f dist=%.0f hp=%.0f lv=%d" % [t, boss.hp, boss.pos.distance_to(ppos), hp, level])
 		if not boss_spawned:
 			boss_spawned = true
+			boss_log_t = t
+			# 闹钟一响，场上小怪全被吓醒跑掉，留下豆子
+			for e in enemies:
+				if e.alive:
+					e.alive = false
+					_drop_bean(e.pos, e.xp)
 			boss = _spawn(K.BOSS, ppos + Vector2(0, -vs.y * 0.5 - 70))
 			banner = "周一早晨来了！"
 			banner_t = 3.0
-			print("COFFEE_BOSS t=%.1f" % t)
-		spawn_acc += dt * 2.0
+			print("COFFEE_BOSS t=%.1f lv=%d hp=%.0f boss_hp=%.0f" % [t, level, hp, boss.max_hp])
+		spawn_acc += dt * 0.4
 		while spawn_acc >= 1.0:
 			spawn_acc -= 1.0
-			if enemies.size() < 90:
+			if enemies.size() < 25:
 				_spawn(K.WORM if rng.randf() < 0.7 else K.GROUNDS, _spawn_pos())
 
 
 func _pick_kind() -> int:
 	var w_worm := 1.0
-	var w_gr := 0.0 if t < 45 else 0.45
-	var w_milk := 0.0 if t < 120 else 0.22
+	# 越往后苦渣团、过期奶占比越高
+	var w_gr := 0.0 if t < 45 else 0.25 + t / 600.0 * 0.6
+	var w_milk := 0.0 if t < 120 else 0.12 + t / 600.0 * 0.35
 	var milks := 0
 	for e in enemies:
 		if e.kind == K.MILK:
 			milks += 1
-	if milks >= 10:
+	if milks >= 5 + int(t / 100.0):
 		w_milk = 0.0
 	var x := rng.randf() * (w_worm + w_gr + w_milk)
 	if x < w_worm:
@@ -461,11 +536,11 @@ func _pick_kind() -> int:
 
 
 func _minute_wave(m: int) -> void:
-	var n := 14 + m * 2
+	var n := 8 + m * 4 + int(m * m * 0.5)
 	var dist := vs.length() * 0.5 + 20
 	for i in n:
 		var a := TAU * i / n
-		if enemies.size() < MAX_ENEMIES + 30:
+		if enemies.size() < MAX_ENEMIES + 40:
 			_spawn(K.WORM, ppos + Vector2(cos(a), sin(a)) * dist)
 	banner = "瞌睡虫围上来了！"
 	banner_t = 2.0
@@ -481,11 +556,14 @@ func _spawn(kind: int, pos: Vector2) -> Enemy:
 	e.kind = kind
 	e.pos = pos
 	e.phase = rng.randf() * TAU
-	var hm := 1.0 + t / 150.0
-	var dm := 1.0 + t / 600.0
+	# 单怪随时间变强：血量、伤害、速度、掉的豆子
+	var hm := 1.0 + t / 150.0 + pow(t / 400.0, 2.0)
+	var dm := (0.55 + 0.45 * minf(t / 150.0, 1.0)) * (1.0 + t / 500.0)  # 前两分半伤害减轻
+	var sm := 1.0 + t / 1500.0
+	var xm := 1 + int(t / 200.0)
 	match kind:
 		K.WORM:
-			e.hp = 9 * hm; e.speed = 42; e.r = 12; e.dmg = 6 * dm; e.xp = 1
+			e.hp = 9 * hm; e.speed = 42; e.r = 12; e.dmg = 5 * dm; e.xp = 1
 		K.GROUNDS:
 			e.hp = 12 * hm; e.speed = 88; e.r = 12; e.dmg = 7 * dm; e.xp = 2
 		K.SMALL:
@@ -493,8 +571,11 @@ func _spawn(kind: int, pos: Vector2) -> Enemy:
 		K.MILK:
 			e.hp = 20 * hm; e.speed = 70; e.r = 14; e.dmg = 6 * dm; e.xp = 3; e.cd = rng.randf_range(1.2, 2.4)
 		K.BOSS:
-			e.hp = 4000 if opt_boss_hp <= 0 else opt_boss_hp; e.speed = 46; e.r = 50; e.dmg = 20; e.xp = 0; e.cd = 2.5
+			e.hp = (BOSS_HP_BASE + BOSS_HP_PER_LV * level) if opt_boss_hp <= 0 else opt_boss_hp; e.speed = 46; e.r = 50; e.dmg = 20; e.xp = 0; e.cd = 2.5
 	e.speed *= rng.randf_range(0.9, 1.1)
+	if kind != K.BOSS:
+		e.speed *= sm
+		e.xp *= xm
 	e.max_hp = e.hp
 	enemies.append(e)
 	return e
@@ -530,6 +611,9 @@ func _update_enemies(dt: float) -> void:
 				_spit(e)
 		elif e.kind == K.BOSS:
 			mv = _boss_update(e, dt, dir)
+			if e.state == "chase" and dist > 320.0:
+				# 离得远就快步追上来，Boss 战不会变成满地图拉扯
+				mv *= 1.0 + clamp((dist - 320.0) / 150.0, 0.0, 3.0)
 		var slowf := 0.5 if e.slow > 0 else 1.0
 		e.slow -= dt
 		e.pos += mv * e.speed * slowf * dt + e.vel * dt
@@ -589,8 +673,8 @@ func _boss_update(e: Enemy, dt: float, dir: Vector2) -> Vector2:
 			if e.cd <= 0:
 				e.atk_i += 1
 				if e.atk_i % 3 == 0:
-					for i in 6:
-						var a := TAU * i / 6.0
+					for i in 4:
+						var a := TAU * i / 4.0
 						_spawn(K.WORM, e.pos + Vector2(cos(a), sin(a)) * 80)
 				if e.atk_i % 2 == 0:
 					e.state = "tele_ring"
@@ -644,7 +728,7 @@ func _hurt(dmg: float) -> void:
 					_damage(e, 12.0)
 		return
 	hp -= dmg
-	iframes = 0.6
+	iframes = 0.8 if t < 120 else 0.6
 	hurt_flash = 0.25
 	if hp <= 0:
 		hp = 0
@@ -672,6 +756,9 @@ func _kill(e: Enemy) -> void:
 		_end_run(true)
 		return
 	_drop_bean(e.pos, e.xp)
+	var hc: float = lerpf(0.06, HEAL_DROP_CHANCE, clamp((t - 90.0) / 150.0, 0.0, 1.0))  # 前1.5分钟6%，到4分钟降到1.5%
+	if rng.randf() < hc and heals.size() < 6:
+		heals.append({"pos": e.pos + Vector2(8, 0)})
 	if e.kind == K.GROUNDS:
 		for s in [-1, 1]:
 			var c := _spawn(K.SMALL, e.pos + Vector2(s * 10, 0))
@@ -695,12 +782,17 @@ func _update_weapons(dt: float) -> void:
 			var pierce := 1 if lv >= 5 else 0
 			var tgt := _nearest(420.0)
 			if jitter > 0 or tgt != null:
-				esp_cd = 0.8
+				esp_cd = 0.65
 				var base := (tgt.pos - ppos).angle() if tgt != null else 0.0
-				for i in n:
+				var shots := n
+				if jitter > 0:
+					# 手抖：失控但更猛——一圈散射 n+4 颗，方向带随机
+					shots = n + 4
+					base = rng.randf() * TAU
+				for i in shots:
 					var a := base + (i - (n - 1) * 0.5) * 0.16
 					if jitter > 0:
-						a = rng.randf() * TAU
+						a = base + TAU * i / shots + rng.randf_range(-0.2, 0.2)
 					if bullets.size() < MAX_BULLETS:
 						bullets.append({"pos": ppos, "vel": Vector2(cos(a), sin(a)) * 430.0, "dmg": dmg, "pierce": pierce, "life": 1.1, "hits": []})
 			else:
@@ -874,7 +966,19 @@ func _drop_bean(pos: Vector2, v: int) -> void:
 
 
 func _update_beans(dt: float) -> void:
-	var magnet := 95.0
+	var magnet: float = 95.0 * (1.0 + 0.1 * meta["magnet"])
+	var hk: Array = []
+	for h in heals:
+		var dh: Vector2 = ppos - h["pos"]
+		var lh := dh.length()
+		if lh < magnet:
+			h["pos"] += dh / max(lh, 0.01) * min(lh, 420.0 * dt)
+		if lh < PR + 8:
+			hp = min(max_hp, hp + HEAL_DROP_AMOUNT)
+			_float(ppos + Vector2(0, -34), "+%d" % int(HEAL_DROP_AMOUNT), Color("#2e9e5b"), 18)
+		else:
+			hk.append(h)
+	heals = hk
 	var keep: Array = []
 	for b in beans:
 		var d: Vector2 = ppos - b["pos"]
@@ -895,7 +999,7 @@ func _update_beans(dt: float) -> void:
 
 
 func _xp_need(l: int) -> int:
-	return 4 + l * 3 + int(l * l * 0.15)
+	return 10 + l * 3 + int(l * l * 0.08)  # 前几级更慢，后期比旧曲线快
 
 
 func _open_picker() -> void:
@@ -903,8 +1007,14 @@ func _open_picker() -> void:
 	for id in SKILL_ORDER:
 		if skills.get(id, 0) < MAX_LV:
 			pool.append(id)
-	pool.shuffle()
+	for i in range(pool.size() - 1, 0, -1):
+		var j := rng.randi_range(0, i)
+		var tmp = pool[i]
+		pool[i] = pool[j]
+		pool[j] = tmp
 	options = pool.slice(0, 3)
+	if options.size() == 3 and hp < max_hp and rng.randf() < HEAL_OFFER_CHANCE:
+		options[2] = "heal"
 	if options.size() < 3:
 		for x in ["heal", "coin"]:
 			if options.size() < 3:
@@ -920,7 +1030,7 @@ func _pick(i: int) -> void:
 		return
 	var id: String = options[i]
 	if id == "heal":
-		hp = min(PLAYER_MAX_HP, hp + 30)
+		hp = min(max_hp, hp + 30)
 	elif id == "coin":
 		bonus_coins += 20
 	else:
@@ -931,9 +1041,8 @@ func _pick(i: int) -> void:
 	level += 1
 	pending_levels -= 1
 	print("COFFEE_PICK ", id, " -> ", skills.get(id, 0), " level=", level)
+	picker_gap = 4.0  # 升级之间至少隔 4 秒，积压的升级排队
 	mode = "play"
-	if pending_levels > 0:
-		_open_picker()
 
 
 func _float(pos: Vector2, text: String, col: Color, size: int) -> void:
@@ -1011,9 +1120,37 @@ func _activate(name: String) -> void:
 		"title":
 			if mode == "result":
 				mode = "title"
+		"reroll":
+			if mode == "levelup" and rerolls > 0 and picker_age > 0.3:
+				rerolls -= 1
+				_open_picker()
 		_:
-			if mode == "levelup" and name.begins_with("card") and picker_age > 0.3:
+			if mode == "title" and name.begins_with("buy_"):
+				_buy(name.substr(4))
+			elif mode == "levelup" and name.begins_with("card") and picker_age > 0.3:
 				_pick(int(name.substr(4)))
+
+
+func _shop_price(it: Dictionary) -> int:
+	return int(it["base"]) + int(it["step"]) * int(meta[it["id"]])
+
+
+func _buy(id: String) -> void:
+	for it in SHOP:
+		if it["id"] != id:
+			continue
+		var lv: int = meta[id]
+		if lv >= int(it["max"]):
+			return
+		var price := _shop_price(it)
+		if total_coins < price:
+			banner = "金币不够"
+			banner_t = 1.0
+			return
+		total_coins -= price
+		meta[id] = lv + 1
+		_save()
+		print("COFFEE_BUY ", id, " -> ", meta[id], " coins=", total_coins)
 
 
 func _notification(what: int) -> void:
@@ -1097,19 +1234,51 @@ func _draw_title() -> void:
 	draw_rect(Rect2(Vector2.ZERO, vs), C_BG)
 	_draw_bg_dots(Vector2(clock * 20, clock * 8))
 	var cx := vs.x * 0.5
-	_draw_cup(Vector2(cx, vs.y * 0.27), 58)
+	var cy := vs.y * 0.12
+	_draw_cup(Vector2(cx, cy), 40)
 	for i in 3:
-		var x := cx - 24 + i * 24
-		var y := vs.y * 0.27 - 84 - fmod(clock * 30 + i * 12, 30)
-		draw_arc(Vector2(x, y), 8, PI * 0.5, PI * 1.5, 8, Color(0.42, 0.26, 0.15, 0.4), 3, true)
-	_text(Vector2(cx, vs.y * 0.42), "咖啡割草", 56, C_DARK)
-	_text(Vector2(cx, vs.y * 0.42 + 54), "拖动走位，自动开火，撑过十分钟", 18, C_BROWN)
-	var r := Rect2(cx - 120, vs.y * 0.6, 240, 76)
+		var x := cx - 18 + i * 18
+		var y := cy - 60 - fmod(clock * 30 + i * 12, 24)
+		draw_arc(Vector2(x, y), 6, PI * 0.5, PI * 1.5, 8, Color(0.42, 0.26, 0.15, 0.4), 3, true)
+	_text(Vector2(cx, vs.y * 0.235), "咖啡割草", 50, C_DARK)
+	_text(Vector2(cx, vs.y * 0.235 + 44), "拖动走位，自动开火，撑过十分钟", 17, C_BROWN)
+	var r := Rect2(cx - 120, vs.y * 0.33, 240, 70)
 	_button("start", r, "开始")
-	_coin_icon(Vector2(cx - 52, vs.y * 0.6 + 112), 11)
-	_text_left(Vector2(cx - 34, vs.y * 0.6 + 112), "金币 %d" % total_coins, 22, C_DARK)
+	var ly := r.end.y + 32
+	_coin_icon(Vector2(cx - 52, ly), 11)
+	_text_left(Vector2(cx - 34, ly), "金币 %d" % total_coins, 22, C_DARK)
 	if best_time > 0:
-		_text(Vector2(cx, vs.y * 0.6 + 148), "最久坚持 %s" % _fmt_time(best_time), 16, C_BROWN)
+		_text(Vector2(cx, ly + 28), "最久坚持 %s" % _fmt_time(best_time), 15, C_BROWN)
+	# 局外强化
+	var y0 := ly + 58
+	_text(Vector2(cx, y0), "强化（永久）", 20, C_DARK)
+	var rw := vs.x - 32
+	var rh := 74.0
+	for i in SHOP.size() + 1:
+		var rr := Rect2(16, y0 + 22 + i * (rh + 10), rw, rh)
+		if i == SHOP.size():
+			# 预留：浓缩冲击（满槽爆发）以后在这里解锁
+			draw_style_box(_sb(Color(1, 1, 1, 0.35), Color(0.42, 0.26, 0.15, 0.35), 16, 2), rr)
+			_text_left(rr.position + Vector2(18, 24), "浓缩冲击", 20, Color(0.42, 0.26, 0.15, 0.55))
+			_text_left(rr.position + Vector2(18, 52), "满槽改成清屏爆发，即将开放。", 15, Color(0.42, 0.26, 0.15, 0.55))
+			continue
+		var it: Dictionary = SHOP[i]
+		var lv: int = meta[it["id"]]
+		var maxed := lv >= int(it["max"])
+		var price := _shop_price(it)
+		var can := not maxed and total_coins >= price
+		draw_style_box(sb_card, rr)
+		targets.append({"name": "buy_" + it["id"], "rect": rr})
+		var ic := rr.position + Vector2(36, rh * 0.5)
+		draw_circle(ic, 22, Color(it["color"]))
+		draw_arc(ic, 22, 0, TAU, 24, C_DARK, 2, true)
+		_text(ic, it["icon"], 22, C_CREAM)
+		_text_left(rr.position + Vector2(70, 22), "%s  Lv%d/%d" % [it["name"], lv, it["max"]], 19, C_DARK)
+		_text_left(rr.position + Vector2(70, 50), it["desc"], 15, C_BROWN)
+		var pr := Rect2(rr.end.x - 84, rr.position.y + 17, 72, 40)
+		var pcol := C_BROWN if can else Color(0.42, 0.26, 0.15, 0.3)
+		draw_style_box(_sb(pcol, Color(0, 0, 0, 0), 12, 0), pr)
+		_text(pr.get_center(), "已满" if maxed else str(price), 18, C_CREAM)
 
 
 func _coin_icon(c: Vector2, r: float) -> void:
@@ -1191,6 +1360,12 @@ func _draw_world() -> void:
 	for b in beans:
 		if _on_screen(b["pos"], 20):
 			_bean(b["pos"], int(b["v"]))
+	for h in heals:
+		if _on_screen(h["pos"], 20):
+			draw_circle(h["pos"], 9, Color("#2e9e5b"))
+			draw_arc(h["pos"], 9, 0, TAU, 16, C_CREAM, 2, true)
+			draw_line(h["pos"] + Vector2(-5, 0), h["pos"] + Vector2(5, 0), C_CREAM, 3)
+			draw_line(h["pos"] + Vector2(0, -5), h["pos"] + Vector2(0, 5), C_CREAM, 3)
 	# 敌人
 	for e in enemies:
 		if _on_screen(e.pos, e.r + 30):
@@ -1244,7 +1419,7 @@ func _draw_world() -> void:
 	# 玩家血条
 	var hb := Rect2(ppos + Vector2(-20, PR + 8), Vector2(40, 6))
 	draw_rect(hb, Color(0, 0, 0, 0.35))
-	draw_rect(Rect2(hb.position, Vector2(40 * hp / PLAYER_MAX_HP, 6)), Color("#d9534f"))
+	draw_rect(Rect2(hb.position, Vector2(40 * hp / max_hp, 6)), Color("#d9534f"))
 	# 飘字
 	for f in floats:
 		_text(f["pos"], f["text"], f["size"], f["col"], 4)
@@ -1408,6 +1583,11 @@ func _draw_hud() -> void:
 	if hint_t > 0:
 		var a: float = min(1.0, hint_t)
 		_text(Vector2(vs.x * 0.5, vs.y * 0.72), "按住屏幕任意处拖动来走位", 20, Color(0.23, 0.14, 0.09, a), 4, Color(1, 0.96, 0.9, a))
+	if tip_t > 0:
+		var ta: float = min(1.0, tip_t)
+		var tr := Rect2(16, vs.y * 0.36 - 24, vs.x - 32, 48)
+		draw_style_box(_sb(Color(0.23, 0.14, 0.09, 0.8 * ta), Color(0, 0, 0, 0), 14, 0), tr)
+		_text(tr.get_center(), tip_text, 18, Color(1, 0.96, 0.9, ta))
 	if banner_t > 0:
 		var a: float = min(1.0, banner_t)
 		_text(Vector2(vs.x * 0.5, vs.y * 0.3), banner, 28, Color(0.75, 0.15, 0.1, a), 5, Color(1, 0.96, 0.9, a))
@@ -1456,6 +1636,11 @@ func _draw_picker() -> void:
 		var lines := _wrap(desc, 21, cw - 40)
 		for li in min(2, lines.size()):
 			_text_left(r.position + Vector2(20, 92 + li * 28), lines[li], 21, C_DARK)
+	if rerolls > 0:
+		var rb := Rect2(vs.x * 0.5 - 100, y0 + 3 * (ch + gap) + 4, 200, 54)
+		draw_style_box(_sb(C_CREAM, C_BROWN, 16, 2), rb)
+		_text(rb.get_center(), "重随（剩%d次）" % rerolls, 20, C_BROWN)
+		targets.append({"name": "reroll", "rect": rb})
 
 
 func _draw_result() -> void:
@@ -1578,7 +1763,7 @@ func _export_state() -> void:
 		"mode": mode, "t": snappedf(t, 0.1), "hp": snappedf(hp, 0.1), "level": level, "xp": xp, "kills": kills,
 		"enemies": enemies.size(), "kinds": counts, "beans": beans.size(), "caf": snappedf(caf, 0.1), "jitter": jitter > 0,
 		"ppos": [snappedf(ppos.x, 0.1), snappedf(ppos.y, 0.1)], "skills": skills, "options": options,
-		"boss_hp": boss.hp if boss != null else -1, "boss_state": boss.state if boss != null else "", "total_coins": total_coins, "run_coins": run_coins, "win": run_win,
+		"boss_hp": boss.hp if boss != null else -1, "boss_state": boss.state if boss != null else "", "total_coins": total_coins, "meta": meta, "rerolls": rerolls, "max_hp": max_hp, "heals": heals.size(), "run_coins": run_coins, "win": run_win,
 		"fps": Engine.get_frames_per_second(), "us_update": int(perf_update), "us_draw": int(perf_draw), "vw": vs.x, "vh": vs.y, "targets": tg,
 	}
 	JavaScriptBridge.eval("window.__coffee=" + JSON.stringify(st) + ";", true)
