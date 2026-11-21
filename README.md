@@ -2,7 +2,7 @@
 
 手机网页试玩：https://zongweishen10-svg.github.io/coffee-gecao/
 
-拖动屏幕走位，自动攻击，撑过十分钟，打败最终 Boss「周一早晨」。标题页可以用金币买永久强化（生命上限、磁铁范围、重随一次）。局内每隔一段时间来一位顾客点单，做完拿小费、回一点血。咖啡因满槽后有 5 秒可以点右下角「爆发」清屏，不点就手抖；两个技能都到 3 级会自动拼成一杯（冰美式 / 拿铁 / 手冲套装），多一条联动。Godot 4.7.2 网页导出（单线程，iPhone Safari 可玩）。
+拖动屏幕走位，自动攻击，撑过十分钟，打败最终 Boss「周一早晨」。标题页可以用金币买永久强化（生命上限、磁铁范围、重随一次）。局内每隔一段时间来一位顾客点单，做完拿零钱小费、回一点血。每击倒一只怪 +1 零钱，打烊（结算）时 7 枚零钱折 1 金币。升级选卡时可以花零钱「下架」不想要的技能（20/40/60/80/100，本局不再出现），或点已拥有的技能把它献祭换回零钱（每级 15）；每下架一个，「极简菜单」全局伤害 +6%，最多 5 个。咖啡因满槽后有 5 秒可以点右下角「爆发」清屏，不点就手抖；两个技能都到 3 级会自动拼成一杯（冰美式 / 拿铁 / 手冲套装），多一条联动。Godot 4.7.2 网页导出（单线程，iPhone Safari 可玩）。
 
 ## 目录
 - `proto/`：Godot 项目源码（`scripts/main.gd` 全部玩法）。
@@ -16,7 +16,7 @@ cd proto
 python3 tools/make_font.py /path/to/NotoSansSC.ttf   # 改了文字就重跑
 godot --headless --export-release "Web" ../index.html
 ```
-测试用 URL 参数：`t` 开局秒数、`god=1` 无敌、`hp` 开局血量、`bosshp` Boss 血量、`auto=1` 自动游玩（1 会躲怪的 bot，2 粗心绕圈，3 站着不动）、`order=kill|bean|elite` 指定顾客订单、`pacifist=1` 不开火（测订单超时）、`caf` 开局咖啡因、`skills=ice:3,espresso:2` 开局技能等级、`offer=espresso` 选卡必出。验收测试：`tools_web/order_test.mjs`、`burst_test.mjs`、`blend_test.mjs`。
+测试用 URL 参数：`t` 开局秒数、`god=1` 无敌、`hp` 开局血量、`bosshp` Boss 血量、`auto=1` 自动游玩（1 会躲怪的 bot，2 粗心绕圈，3 站着不动）、`order=kill|bean|elite` 指定顾客订单、`pacifist=1` 不开火（测订单超时）、`caf` 开局咖啡因、`skills=ice:3,espresso:2` 开局技能等级、`offer=espresso` 选卡必出、`banish=foam,ice` 开局就下架、`change=50` 开局零钱。验收测试：`tools_web/order_test.mjs`、`burst_test.mjs`、`blend_test.mjs`、`change_test.mjs`。
 
 无头平衡模拟：`cd proto && godot --headless -- --auto=1 --steps=30 --quit=1 --seed=7`
 

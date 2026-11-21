@@ -47,6 +47,12 @@ const BLENDS := {
 	"pourover": {"name": "手冲套装", "a": "kettle", "b": "grinder", "need": 3, "desc": "热水处也会绞伤。"},
 }
 const C_GOLD := Color("#e0a526")
+const C_COPPER := Color("#b87333")   # 零钱（局内币）专用色，和金币的金色分开
+# 打烊折算：零钱 ÷ CHANGE_RATE。规格原值 5:1；bot 满局击杀比规格估的多（约 1000–2200 而不是 400），
+# 5:1 会让总收入比旧公式高约 26%，按规格「偏了调汇率不改结构」改成 7:1（9 局平均 +2.6%）
+const CHANGE_RATE := 7
+const BANISH_MAX := 5                # 一局最多下架 5 个技能
+const MENU_BONUS := 0.06             # 每下架一个，全局伤害 +6%
 const SKILLS := {
 	"kettle": {"name": "手冲壶", "icon": "壶", "color": "#4f9bc7", "desc": "身边每秒转一圈热水。",
 		"ups": ["手冲壶多转一股热水。", "手冲壶的热水更烫了。", "手冲壶再多转一股热水。", "手冲壶转得更大更烫。"]},
@@ -63,7 +69,7 @@ const SKILLS := {
 }
 const EXTRA := {
 	"heal": {"name": "热拿铁", "icon": "血", "color": "#c0392b", "desc": "喝一杯，恢复30点生命。"},
-	"coin": {"name": "小费罐", "icon": "币", "color": "#e0a63a", "desc": "立刻多拿20枚金币。"},
+	"coin": {"name": "零钱 +20", "icon": "零", "color": "#b87333", "desc": "立刻多拿20零钱，打烊时折成金币。"},
 }
 
 enum K { WORM, GROUNDS, SMALL, MILK, BOSS }
@@ -142,7 +148,11 @@ var options: Array = []
 var picker_age := 0.0
 var run_win := false
 var run_coins := 0
-var bonus_coins := 0
+var change := 0               # 零钱：局内币，不进存档，打烊按 CHANGE_RATE 折金币
+var banished := {}            # 本局已下架的技能 id
+var banish_spent := 0         # 本局下架总花费（只用于日志和状态导出）
+var opt_change := 0           # 测试参数：开局零钱
+var opt_banish: Array = []    # 测试参数：开局就下架的技能
 var boss_spawned := false
 var boss: Enemy = null
 var banner := ""
@@ -277,6 +287,8 @@ func _parse_args() -> void:
 					if pr.size() == 2:
 						opt_skills[pr[0]] = int(pr[1])
 			"offer": opt_offer = Array(v.split(",", false))
+			"banish": opt_banish = Array(v.split(",", false))
+			"change": opt_change = max(0, int(v))
 
 
 func _load_save() -> void:
@@ -355,7 +367,12 @@ func _start_run() -> void:
 		_check_blends()   # 测试参数直接给了双 Lv3 时立刻成杯
 	run_win = false
 	run_coins = 0
-	bonus_coins = 0
+	change = opt_change
+	banished = {}
+	banish_spent = 0
+	for bid in opt_banish:
+		if SKILLS.has(bid) and not banished.has(bid) and banished.size() < BANISH_MAX:
+			_banish(bid, 0, 0)   # 测试参数：走同一套清理逻辑，不计费不返还
 	boss_spawned = false
 	boss = null
 	banner = ""
@@ -385,11 +402,11 @@ func _end_run(win: bool) -> void:
 	run_win = win
 	mode = "result"
 	pointer_down = false
-	run_coins = int(kills / 10) + int(min(t, RUN_LEN) / 20.0) + (150 if win else 0) + bonus_coins
+	run_coins = int(min(t, RUN_LEN) / 20.0) + (150 if win else 0) + int(change / CHANGE_RATE)
 	total_coins += run_coins
 	best_time = max(best_time, t)
 	_save()
-	print("COFFEE_END win=%s t=%.1f kills=%d level=%d coins=%d skills=%s" % [win, t, kills, level, run_coins, JSON.stringify(skills)])
+	print("COFFEE_END win=%s t=%.1f kills=%d level=%d coins=%d change=%d banish_spent=%d banished=%s skills=%s" % [win, t, kills, level, run_coins, change, banish_spent, JSON.stringify(banished.keys()), JSON.stringify(skills)])
 	if opt_quit:
 		get_tree().quit()
 
@@ -827,6 +844,7 @@ func _hurt(dmg: float) -> void:
 func _damage(e: Enemy, dmg: float, knock_dir := Vector2.ZERO, knock := 0.0) -> void:
 	if not e.alive:
 		return
+	dmg *= 1.0 + MENU_BONUS * banished.size()   # 极简菜单：每下架一个技能伤害 +6%
 	e.hp -= dmg
 	e.flash = 0.08
 	if e.kind != K.BOSS and knock > 0:
@@ -844,6 +862,7 @@ func _kill(e: Enemy) -> void:
 		boss = null
 		_end_run(true)
 		return
+	change += 1   # 零钱：普通怪击杀 +1（Boss 直接结算不给）
 	_drop_bean(e.pos, e.xp)
 	_order_on_kill(e)
 	var hc: float = lerpf(0.06, HEAL_DROP_CHANCE, clamp((t - 90.0) / 150.0, 0.0, 1.0))  # 前1.5分钟6%，到4分钟降到1.5%
@@ -861,7 +880,7 @@ func _reward_heal(x: float) -> void:
 
 
 func _reward_coin(x: int) -> void:
-	bonus_coins += x
+	change += x   # 订单小费和零钱卡都改发零钱
 
 
 func _update_customers(dt: float) -> void:
@@ -947,7 +966,7 @@ func _customer_done(c: Dictionary) -> void:
 	c["enemy"] = null
 	next_cust_t = t + CUST_GAP
 	cust_stats["done"] += 1
-	print("COFFEE_ORDER_DONE t=%.1f kind=%s hp=%.0f bonus=%d" % [t, c["kind"], hp, bonus_coins])
+	print("COFFEE_ORDER_DONE t=%.1f kind=%s hp=%.0f change=%d" % [t, c["kind"], hp, change])
 
 
 func _customer_timeout(c: Dictionary) -> void:
@@ -976,6 +995,8 @@ func _customers_leave_for_boss() -> void:
 
 func _draw_customers() -> void:
 	# 在世界坐标里画（HUD 之后再画，所以不会挡住顶部的 Boss 血条）
+	if mode == "result":
+		return   # 结算界面不画顾客，免得气泡透过「回标题」按钮
 	for c in customers:
 		var p: Vector2 = c["pos"]
 		if not c["elite"]:
@@ -1003,6 +1024,11 @@ func _draw_customers() -> void:
 		if br.position.y < vt:
 			bp.y += vt - br.position.y
 			br.position.y = vt
+		# 从底部走来的精英怪：气泡别压到技能栏和爆发按钮上
+		var vbm := ppos.y + vs.y * 0.5 - 112.0
+		if br.end.y > vbm:
+			bp.y -= br.end.y - vbm
+			br.position.y = vbm - br.size.y
 		draw_style_box(_sb(Color(1, 1, 1, 0.95), C_BROWN, 12, 2), br)
 		draw_colored_polygon(PackedVector2Array([bp + Vector2(-7, 16), bp + Vector2(7, 16), bp + Vector2(0, 26)]), C_BROWN)
 		var ic := Vector2(br.position.x + 18, bp.y)
@@ -1276,7 +1302,7 @@ func _xp_need(l: int) -> int:
 func _open_picker() -> void:
 	var pool: Array = []
 	for id in SKILL_ORDER:
-		if skills.get(id, 0) < MAX_LV:
+		if skills.get(id, 0) < MAX_LV and not banished.has(id):
 			pool.append(id)
 	for i in range(pool.size() - 1, 0, -1):
 		var j := rng.randi_range(0, i)
@@ -1286,7 +1312,7 @@ func _open_picker() -> void:
 	options = pool.slice(0, 3)
 	for oi in opt_offer.size():
 		var fid: String = opt_offer[oi]
-		if oi < 3 and skills.get(fid, 0) < MAX_LV:
+		if oi < 3 and skills.get(fid, 0) < MAX_LV and not banished.has(fid):
 			options.erase(fid)
 			options.insert(oi, fid)
 	options = options.slice(0, 3)
@@ -1334,6 +1360,48 @@ func _check_blends() -> void:
 			banner = "拼配完成：%s！" % b["name"]
 			banner_t = 2.0
 			print("COFFEE_BLEND ", bid, " t=%.1f" % t)
+
+
+func _banish_fee() -> int:
+	# 第 n 次下架未拥有的技能：20 / 40 / 60 / 80 / 100
+	return 20 + 20 * banished.size()
+
+
+func _banish_refund(id: String) -> int:
+	return 15 * int(skills.get(id, 0))
+
+
+func _banish(id: String, fee: int, refund: int) -> void:
+	# 下架 / 献祭共用：技能永久移出本局，盾和拼配一起清理
+	var lv: int = skills.get(id, 0)
+	skills.erase(id)
+	banished[id] = true
+	change += refund - fee
+	banish_spent += fee
+	if id == "foam":
+		shield = 0
+	for bid in BLENDS:
+		var b: Dictionary = BLENDS[bid]
+		if blends.has(bid) and (b["a"] == id or b["b"] == id):
+			blends.erase(bid)
+			banner = "拼配失效：%s" % b["name"]
+			banner_t = 2.0
+			print("COFFEE_BLEND_LOST ", bid)
+	print("COFFEE_BANISH %s lv=%d fee=%d refund=%d count=%d" % [id, lv, fee, refund, banished.size()])
+
+
+func _try_banish(id: String) -> void:
+	# 选卡界面的下架/献祭按钮：不选卡、不消耗等级，做完刷新三张
+	if mode != "levelup" or picker_age <= 0.3 or not SKILLS.has(id) or banished.has(id) or banished.size() >= BANISH_MAX:
+		return
+	if skills.get(id, 0) > 0:
+		_banish(id, 0, _banish_refund(id))
+	else:
+		var fee := _banish_fee()
+		if change < fee:
+			return
+		_banish(id, fee, 0)
+	_open_picker()
 
 
 func _blend_hint(id: String) -> String:
@@ -1465,6 +1533,8 @@ func _adm_need_run() -> void:
 
 
 func _adm_set_skill(id: String, lv: int) -> void:
+	if banished.has(id):
+		return   # 已下架的技能本局不再回来
 	var old: int = skills.get(id, 0)
 	if lv <= old:
 		return
@@ -1482,6 +1552,9 @@ func _adm_action(name: String) -> void:
 			_save()
 		"adm_god":
 			opt_god = not opt_god
+		"adm_change":
+			_adm_need_run()
+			change += 50
 		"adm_next_min":
 			_adm_need_run()
 			if t < RUN_LEN:
@@ -1582,7 +1655,9 @@ func _pointer_move(pos: Vector2) -> void:
 
 
 func _target_at(pos: Vector2) -> String:
-	for tg in targets:
+	# 后登记的画在上面，倒序找（卡牌右上角的下架按钮压在卡牌上）
+	for i in range(targets.size() - 1, -1, -1):
+		var tg: Dictionary = targets[i]
 		if (tg["rect"] as Rect2).has_point(pos):
 			return tg["name"]
 	return ""
@@ -1609,7 +1684,13 @@ func _activate(name: String) -> void:
 				rerolls -= 1
 				_open_picker()
 		_:
-			if mode == "admin" and name.begins_with("adm_"):
+			if mode == "levelup" and name.begins_with("banishown_"):
+				_try_banish(name.substr(10))
+			elif mode == "levelup" and name.begins_with("banish_"):
+				var bi := int(name.substr(7))
+				if bi >= 0 and bi < options.size():
+					_try_banish(options[bi])
+			elif mode == "admin" and name.begins_with("adm_"):
 				_adm_action(name)
 			elif mode == "title" and name.begins_with("buy_"):
 				_buy(name.substr(4))
@@ -1663,8 +1744,8 @@ func _draw_all() -> void:
 		return
 	_draw_world()
 	_draw_hud()
-	if opt_god or run_cheat:
-		_draw_cheat_mark()
+	if (opt_god or run_cheat) and mode != "levelup":
+		_draw_cheat_mark()   # 选卡界面左上角是零钱余额，测试标记让位
 	match mode:
 		"admin":
 			_draw_admin()
@@ -1708,7 +1789,7 @@ func _draw_admin() -> void:
 			["adm_maxall", "技能全满", false], ["adm_skillpage", "选技能+1", false],
 			["adm_bl_americano", "凑冰美式", false], ["adm_bl_latteart", "凑拿铁", false],
 			["adm_bl_pourover", "凑手冲套装", false], ["adm_cust", "刷普通顾客", false],
-			["adm_cust_elite", "刷精英顾客", false],
+			["adm_cust_elite", "刷精英顾客", false], ["adm_change", "零钱+50", false],
 			["adm_reset", "再点一次确认" if clock < adm_confirm_until else "重置存档", clock < adm_confirm_until],
 		]
 	var rows := ceili(items.size() / 2.0)
@@ -2116,6 +2197,8 @@ func _draw_hud() -> void:
 	var tt := _fmt_time(min(t, RUN_LEN))
 	_text(Vector2(vs.x * 0.5, 70), tt, 28, C_RED if t >= RUN_LEN else C_DARK, 4, C_CREAM)
 	_text_left(Vector2(bx, 68), "Lv %d" % level, 18, C_DARK)
+	var lvw := font.get_string_size("Lv %d" % level, HORIZONTAL_ALIGNMENT_LEFT, -1, 18).x
+	_text_left(Vector2(bx + lvw + 10, 68), "零钱 %d" % change, 15, C_COPPER)
 	var ks := "击倒 %d" % kills
 	var kw := font.get_string_size(ks, HORIZONTAL_ALIGNMENT_LEFT, -1, 18).x
 	_text_left(Vector2(vs.x - 16 - kw, 68), ks, 18, C_DARK)
@@ -2182,12 +2265,21 @@ func _icon(c: Vector2, id: String, r: float) -> void:
 
 
 func _draw_picker() -> void:
+	# 390×844 竖屏布局（从上到下）：标题 → 零钱余额/精简行 → 三张卡（右上角下架/返还）→ 已拥有技能条 → 重随
 	draw_rect(Rect2(Vector2.ZERO, vs), Color(0.1, 0.06, 0.03, 0.6))
-	_text(Vector2(vs.x * 0.5, vs.y * 0.17), "升级！选一个", 32, C_CREAM, 5, C_DARK)
+	_text(Vector2(vs.x * 0.5, 108), "升级！选一个", 30, C_CREAM, 5, C_DARK)
+	var can_banish := banished.size() < BANISH_MAX
+	var fee := _banish_fee()
+	_text_left(Vector2(20, 148), "零钱 %d" % change, 22, Color("#e8a26a"))
+	var note := "打烊时 %d:1 折金币" % CHANGE_RATE
+	var nw := font.get_string_size(note, HORIZONTAL_ALIGNMENT_LEFT, -1, 14).x
+	_text_left(Vector2(vs.x - 20 - nw, 150), note, 14, C_CREAM)
+	if banished.size() > 0:
+		_text(Vector2(vs.x * 0.5, 174), "菜单精简 +%d%% 伤害" % int(round(MENU_BONUS * 100 * banished.size())), 15, C_GOLD)
 	var cw := vs.x - 40
-	var ch := 138.0
-	var gap := 16.0
-	var y0 := vs.y * 0.17 + 44
+	var ch := 132.0
+	var gap := 10.0
+	var y0 := 190.0
 	for i in options.size():
 		var id: String = options[i]
 		var r := Rect2(20, y0 + i * (ch + gap), cw, ch)
@@ -2199,29 +2291,61 @@ func _draw_picker() -> void:
 		_text_left(r.position + Vector2(76, 32), d["name"], 26, C_DARK)
 		var desc: String
 		if SKILLS.has(id):
-			# 等级小圆点
+			# 等级小圆点：紧跟名字
+			var nwid := font.get_string_size(d["name"], HORIZONTAL_ALIGNMENT_LEFT, -1, 26).x
 			for j in MAX_LV:
-				var pc := r.position + Vector2(cw - 110 + j * 19, 32)
+				var pc := r.position + Vector2(76 + nwid + 14 + j * 14, 32)
 				var filled := j < lv
 				var is_new := j == lv
-				draw_circle(pc, 7, C_XP if is_new else (C_BROWN if filled else Color(0, 0, 0, 0.12)))
+				draw_circle(pc, 5, C_XP if is_new else (C_BROWN if filled else Color(0, 0, 0, 0.12)))
 			var tag := "新技能" if lv == 0 else "Lv%d→%d" % [lv, lv + 1]
-			_text_left(r.position + Vector2(76, 62), tag, 15, C_XP.darkened(0.25) if lv == 0 else C_BROWN)
+			_text_left(r.position + Vector2(76, 64), tag, 15, C_XP.darkened(0.25) if lv == 0 else C_BROWN)
 			var bh := _blend_hint(id)
 			if bh != "":
 				var bt := "拼配：%s" % bh
-				var bw := font.get_string_size(bt, HORIZONTAL_ALIGNMENT_LEFT, -1, 16).x
-				var bpos := Vector2(r.end.x - 20 - bw, r.position.y + 62)
-				draw_style_box(_sb(Color(C_GOLD, 0.18), C_GOLD, 8, 2), Rect2(bpos.x - 8, bpos.y - 13, bw + 16, 26))
-				_text_left(bpos, bt, 16, C_GOLD.darkened(0.25))
+				var bw := font.get_string_size(bt, HORIZONTAL_ALIGNMENT_LEFT, -1, 15).x
+				var bpos := Vector2(r.end.x - 14 - bw, r.position.y + 66)
+				draw_style_box(_sb(Color(C_GOLD, 0.18), C_GOLD, 8, 2), Rect2(bpos.x - 7, bpos.y - 12, bw + 14, 24))
+				_text_left(bpos, bt, 15, C_GOLD.darkened(0.25))
+			# 右上角：下架 -fee（未拥有）/ 返还 +refund（已拥有），后果直接写在按钮上
+			if can_banish:
+				var bb := Rect2(r.end.x - 98, r.position.y + 8, 88, 42)
+				var owned := lv > 0
+				var lab := "返还 +%d" % _banish_refund(id) if owned else "下架 -%d" % fee
+				var ok := owned or change >= fee
+				var fill := C_COPPER if ok else Color(0.55, 0.5, 0.45, 0.35)
+				draw_style_box(_sb(fill, C_DARK if ok else Color(0, 0, 0, 0.15), 10, 2), bb)
+				_text(bb.get_center(), lab, 16, C_CREAM if ok else Color(0.3, 0.25, 0.2, 0.6))
+				# 置灰时登记一个空目标：点了没反应，也不会误选到下面的卡
+				targets.append({"name": "banish_%d" % i if ok else "noop", "rect": bb})
 			desc = d["desc"] if lv == 0 else d["ups"][lv - 1]
 		else:
 			desc = d["desc"]
-		var lines := _wrap(desc, 21, cw - 40)
+		var lines := _wrap(desc, 20, cw - 40)
 		for li in min(2, lines.size()):
-			_text_left(r.position + Vector2(20, 92 + li * 28), lines[li], 21, C_DARK)
+			_text_left(r.position + Vector2(20, 94 + li * 26), lines[li], 20, C_DARK)
+	# 已拥有技能条：点图标 = 献祭（满级技能不进卡池，只能从这里献祭）
+	var owned_ids: Array = []
+	for id in SKILL_ORDER:
+		if skills.get(id, 0) > 0:
+			owned_ids.append(id)
+	var sy := y0 + 3 * (ch + gap) + 8
+	if owned_ids.size() > 0:
+		_text(Vector2(vs.x * 0.5, sy + 8), "已拥有 · 点图标献祭换零钱" if can_banish else "已拥有（下架已满 5 个）", 14, C_CREAM)
+		var iw := 56.0
+		var sx := vs.x * 0.5 - iw * owned_ids.size() * 0.5
+		for k in owned_ids.size():
+			var id: String = owned_ids[k]
+			var c := Vector2(sx + iw * (k + 0.5), sy + 42)
+			_icon(c, id, 18)
+			if _in_blend(id):
+				draw_arc(c, 19.5, 0, TAU, 28, C_GOLD, 3.5, true)
+			_text(c + Vector2(14, 14), str(skills[id]), 13, C_CREAM, 4, C_DARK)
+			if can_banish:
+				_text(c + Vector2(0, 31), "+%d" % _banish_refund(id), 13, Color("#e8a26a"), 3, C_DARK)
+				targets.append({"name": "banishown_" + id, "rect": Rect2(c.x - 26, c.y - 24, 52, 64)})
 	if rerolls > 0:
-		var rb := Rect2(vs.x * 0.5 - 100, y0 + 3 * (ch + gap) + 4, 200, 54)
+		var rb := Rect2(vs.x * 0.5 - 100, sy + 92, 200, 48)
 		draw_style_box(_sb(C_CREAM, C_BROWN, 16, 2), rb)
 		_text(rb.get_center(), "重随（剩%d次）" % rerolls, 20, C_BROWN)
 		targets.append({"name": "reroll", "rect": rb})
@@ -2246,8 +2370,8 @@ func _draw_result() -> void:
 		_text_left(Vector2(pr.end.x - 36 - vw, ry), rows[i][1], 26, C_DARK)
 		draw_line(Vector2(pr.position.x + 30, ry + 24), Vector2(pr.end.x - 30, ry + 24), Color(0.42, 0.26, 0.15, 0.15), 1)
 	var tot := "金币总数 %d" % total_coins
-	if bonus_coins > 0:
-		tot = "含小费 +%d · 金币总数 %d" % [bonus_coins, total_coins]
+	if change > 0:
+		tot = "零钱 %d → 折算 +%d · 金币总数 %d" % [change, int(change / CHANGE_RATE), total_coins]
 	_text(Vector2(cx, y + 352), tot, 16, C_BROWN)
 	_button("again", Rect2(cx - 120, y + 378, 240, 70), "再来一局")
 	_button("title", Rect2(cx - 70, pr.end.y + 18, 140, 48), "回标题", false)
@@ -2350,7 +2474,7 @@ func _export_state() -> void:
 		"mode": mode, "t": snappedf(t, 0.1), "hp": snappedf(hp, 0.1), "level": level, "xp": xp, "kills": kills,
 		"enemies": enemies.size(), "kinds": counts, "beans": beans.size(), "caf": snappedf(caf, 0.1), "jitter": jitter > 0,
 		"ppos": [snappedf(ppos.x, 0.1), snappedf(ppos.y, 0.1)], "skills": skills, "options": options,
-		"boss_hp": boss.hp if boss != null else -1, "boss_state": boss.state if boss != null else "", "total_coins": total_coins, "meta": meta, "rerolls": rerolls, "max_hp": max_hp, "heals": heals.size(), "bonus_coins": bonus_coins, "full": snappedf(caf_full_t, 0.1), "bursts": burst_count, "adm": adm_page if mode == "admin" else "", "god": opt_god, "cheat": run_cheat, "blends": blends.keys(), "hints": options.map(func(o): return _blend_hint(o) if SKILLS.has(o) else ""), "blend_stats": blend_stats, "onslow": enemies.filter(func(e): return e.alive and e.slow > 0 and e.kind != K.BOSS).size(), "boss_slow": boss != null and boss.slow > 0, "atk": snappedf(_atk_mult(), 0.01), "drag": pointer_down, "onscreen": enemies.filter(func(e): return e.alive and e.kind != K.BOSS and _on_screen(e.pos, 0)).size(), "next_cust_t": snappedf(next_cust_t, 0.1), "cust_stats": cust_stats, "customers": customers.map(func(c): return {"kind": c["kind"], "need": c["need"], "have": c["have"], "ttl": snappedf(c["ttl"], 0.1), "elite": c["elite"], "born": snappedf(c["born"], 0.1)}), "run_coins": run_coins, "win": run_win,
+		"boss_hp": boss.hp if boss != null else -1, "boss_state": boss.state if boss != null else "", "total_coins": total_coins, "meta": meta, "rerolls": rerolls, "max_hp": max_hp, "heals": heals.size(), "change": change, "banish_spent": banish_spent, "banished": banished.keys(), "change_rate": CHANGE_RATE, "menu_mult": snappedf(1.0 + MENU_BONUS * banished.size(), 0.01), "full": snappedf(caf_full_t, 0.1), "bursts": burst_count, "adm": adm_page if mode == "admin" else "", "god": opt_god, "cheat": run_cheat, "blends": blends.keys(), "hints": options.map(func(o): return _blend_hint(o) if SKILLS.has(o) else ""), "blend_stats": blend_stats, "onslow": enemies.filter(func(e): return e.alive and e.slow > 0 and e.kind != K.BOSS).size(), "boss_slow": boss != null and boss.slow > 0, "atk": snappedf(_atk_mult(), 0.01), "drag": pointer_down, "onscreen": enemies.filter(func(e): return e.alive and e.kind != K.BOSS and _on_screen(e.pos, 0)).size(), "next_cust_t": snappedf(next_cust_t, 0.1), "cust_stats": cust_stats, "customers": customers.map(func(c): return {"kind": c["kind"], "need": c["need"], "have": c["have"], "ttl": snappedf(c["ttl"], 0.1), "elite": c["elite"], "born": snappedf(c["born"], 0.1)}), "run_coins": run_coins, "win": run_win,
 		"fps": Engine.get_frames_per_second(), "us_update": int(perf_update), "us_draw": int(perf_draw), "vw": vs.x, "vh": vs.y, "targets": tg,
 	}
 	JavaScriptBridge.eval("window.__coffee=" + JSON.stringify(st) + ";", true)
