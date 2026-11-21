@@ -89,30 +89,30 @@ s = await waitFor((x) => cust(x), 15000, 'customer');
 const c1 = cust(s);
 result.c1_appear = { t: s.t, born: c1.born, kind: c1.kind, progress: `${c1.have}/${c1.need}`, ttl: c1.ttl };
 await sleep(600); await shot('customer_bubble');
-const hpBefore = s.hp, bonusBefore = s.bonus_coins;
+const hpBefore = s.hp, bonusBefore = (s.change - s.kills);
 s = await wander(45000, (x) => x.cust_stats.done >= 1);
-result.c2_reward = { hp_before: hpBefore, hp_after: s.hp, max_hp: s.max_hp, bonus_before: bonusBefore, bonus_after: s.bonus_coins, done: s.cust_stats.done, next_cust_t: s.next_cust_t, t: s.t };
+result.c2_reward = { hp_before: hpBefore, hp_after: s.hp, max_hp: s.max_hp, bonus_before: bonusBefore, bonus_after: (s.change - s.kills), done: s.cust_stats.done, next_cust_t: s.next_cust_t, t: s.t };
 await shot('order_done');
 // heal cap: hp 95, bean order
 s = await startRun('t=55&hp=95&god=1&order=bean');
 s = await waitFor((x) => cust(x), 15000, 'customer2');
 s = await wander(45000, (x) => x.cust_stats.done >= 1);
-result.c2_cap = { hp_after: s.hp, max_hp: s.max_hp, bonus_after: s.bonus_coins, done: s.cust_stats.done };
+result.c2_cap = { hp_after: s.hp, max_hp: s.max_hp, bonus_after: (s.change - s.kills), done: s.cust_stats.done };
 // settlement: no god, finish an order, then die and read result
 s = await startRun('t=55&hp=40&order=kill');
 s = await wander(60000, (x) => x.cust_stats.done >= 1 || x.mode === 'result');
-const bonusAtDone = s.bonus_coins;
+const bonusAtDone = (s.change - s.kills);
 for (let i = 0; i < 400; i++) { s = await st(); if (s.mode === 'result') break; if (s.mode === 'levelup') await tapTarget('card0'); await sleep(600); }
 await sleep(400); await shot('result_with_bonus');
-result.c2_settle = { bonus_coins: s.bonus_coins, bonus_at_done: bonusAtDone, run_coins: s.run_coins, kills: s.kills, t: s.t, base: Math.floor(s.kills / 10) + Math.floor(Math.min(s.t, 600) / 20), orders_done: s.cust_stats.done };
+result.c2_settle = { bonus_coins: (s.change - s.kills), bonus_at_done: bonusAtDone, run_coins: s.run_coins, kills: s.kills, t: s.t, change: s.change, expect: Math.floor(Math.min(s.t, 600) / 20) + Math.floor(s.change / (s.change_rate || 5)), orders_done: s.cust_stats.done };
 // ---- #3: timeout (god + pacifist: no kills, no beans) ----
 s = await startRun('t=55&god=1&pacifist=1&order=bean');
 s = await waitFor((x) => cust(x), 15000, 'customer3');
-const born3 = cust(s).born, snap = { hp: s.hp, bonus: s.bonus_coins, level: s.level, max_hp: s.max_hp };
+const born3 = cust(s).born, snap = { hp: s.hp, bonus: (s.change - s.kills), level: s.level, max_hp: s.max_hp };
 s = await waitFor((x) => !cust(x), 60000, 'timeout');
 await sleep(300); await shot('customer_left');
 result.c3_timeout = { born: born3, left_at: s.t, timeout_count: s.cust_stats.timeout, done: s.cust_stats.done, next_cust_t: s.next_cust_t,
-  before: snap, after: { hp: s.hp, bonus: s.bonus_coins, level: s.level, max_hp: s.max_hp } };
+  before: snap, after: { hp: s.hp, bonus: (s.change - s.kills), level: s.level, max_hp: s.max_hp } };
 s = await waitFor((x) => cust(x), 100000, 'next customer');
 result.c3_next = { appeared_at: cust(s).born, gap_after_leave: +(cust(s).born - result.c3_timeout.next_cust_t + 75).toFixed(1) };
 // ---- #5: customer present when boss arrives (normal + elite) ----
